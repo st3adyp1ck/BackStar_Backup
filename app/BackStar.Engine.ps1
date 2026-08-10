@@ -135,9 +135,16 @@ function Process-LogChunk([string]$text) {
     # Cap what hits the UI per tick; appending thousands of lines stalls the window.
     $max = 80
     $shown = if ($lines.Count -gt $max) { $lines.GetRange(0, $max) } else { $lines }
+    # Under /MIR, an EXTRA file is about to be deleted - worth flagging in amber. Under /E
+    # (incremental, non-destructive jobs), EXTRA just means "exists at the destination but not
+    # in this source snapshot" - normal and harmless, so don't paint every incremental run amber.
+    $mirrorRun = $true
+    if ($script:CurrentJob -and $script:CurrentJob.Job -and ($null -ne $script:CurrentJob.Job.Mirror)) {
+        $mirrorRun = [bool]$script:CurrentJob.Job.Mirror
+    }
     foreach ($ln in $shown) {
         if ($ln -match '\bERROR\b') { Append-Log $ln 'Error' }
-        elseif ($ln -match '\*EXTRA') { Append-Log $ln 'Warn' }
+        elseif ($ln -match '\*EXTRA') { Append-Log $ln (if ($mirrorRun) { 'Warn' } else { 'Muted' }) }
         else { Append-Log $ln 'Muted' }
     }
     if ($lines.Count -gt $max) {
@@ -147,11 +154,25 @@ function Process-LogChunk([string]$text) {
 }
 
 function Set-UiEnabled([bool]$enabled) {
-    $btnAdd.Enabled        = $enabled
-    $btnRemove.Enabled     = $enabled
-    $btnBrowseDest.Enabled = $enabled
-    $lstSources.Enabled    = $enabled
-    $chkGitGc.Enabled      = $enabled
+    # Both tabs share one job engine/queue, so everything that could start or reconfigure a run -
+    # on EITHER tab, plus the tab switcher itself - is disabled while a backup is in progress.
+    # Only the shared Start/Cancel button stays enabled, so cancelling always works.
+    $btnAdd.Enabled            = $enabled
+    $btnRemove.Enabled         = $enabled
+    $btnBrowseDest.Enabled     = $enabled
+    $lstSources.Enabled        = $enabled
+    $chkGitGc.Enabled          = $enabled
+    $btnTabProject.Enabled     = $enabled
+    $btnTabSystem.Enabled      = $enabled
+    if ($lvCategories) {
+        $lvCategories.Enabled         = $enabled
+        $btnSelectAll.Enabled         = $enabled
+        $btnRescanSizes.Enabled       = $enabled
+        $lstSystemCustom.Enabled      = $enabled
+        $btnAddCustom.Enabled         = $enabled
+        $btnRemoveCustom.Enabled      = $enabled
+        $btnBrowseSystemDest.Enabled  = $enabled
+    }
 }
 
 function Set-StartButtonMode([bool]$isRunning) {

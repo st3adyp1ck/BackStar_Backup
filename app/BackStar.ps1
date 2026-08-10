@@ -2,7 +2,8 @@
 # BackStar - portable USB backup tool: Project Backup (mirror) + System Backup (incremental).
 # This is the entry point: it loads shared types/state, dot-sources the module files below
 # (in the same script scope, so $script: state and functions are shared across all of them),
-# then builds/runs the form. Launched via BackStar.vbs -> BackStar.bat -> this file.
+# builds the form shell + tab scaffold, then hands control to the tab modules and runs the form.
+# Launched via BackStar.vbs -> BackStar.bat -> this file.
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -27,6 +28,14 @@ $script:ExcludePaths = @(
     'apps\mobile\ios\App\App\public',
     'apps\mobile\android\app\src\main\assets\public'
 )
+# System Backup junk/cache excludes - browser caches, thumbnail/temp files. Kept separate from
+# $script:ExcludeDirs above since that list is tuned for source-code projects, not personal files.
+$script:SystemExcludeDirs = @(
+    'Cache', 'Code Cache', 'GPUCache', 'cache2', 'Service Worker', 'CacheStorage', 'blob_storage',
+    'Crashpad', 'IndexedDB', '$RECYCLE.BIN', 'System Volume Information'
+)
+$script:SystemExcludeFiles = @('Thumbs.db', 'desktop.ini', '*.tmp')
+
 $script:ConfigPath   = Join-Path $PSScriptRoot 'BackStar.config.json'
 $script:LogoPath     = Join-Path $PSScriptRoot 'assets\BackStar-logo.png'
 $script:MissingTag   = '[missing] '
@@ -47,28 +56,368 @@ $script:TotalFilesCopied = 0       # files copied across the whole run
 $script:JobStart     = $null
 $script:CurrentFile  = ''          # file robocopy is currently copying (leaf shown in the bar)
 $script:CurrentPct   = ''          # live per-file progress, e.g. ' 47%' (empty when unknown)
+$script:ActiveTab    = 'Project'   # 'Project' | 'System' - which tab's config Start/Cancel acts on
 
 # ---------- module loading ----------
-# Dot-sourcing (not '&') is required: it runs each file's code in THIS script's scope, so
-# $script: state and every function defined below are shared across all modules as if this
-# were still one file. Order matters - later modules use functions/controls the earlier ones define.
+# The '.' dot-source operator below (NOT '&') is required: it runs each file's code in the
+# CALLER's scope, so $script: state and every function/variable a module defines lands in this
+# script's own top-level scope, shared by every other module, as if this were still one file.
+# That's also why the path-check below is a plain function but the actual dot-sourcing is NOT:
+# dot-sourcing FROM INSIDE A FUNCTION would merge the module into that function's own throwaway
+# scope instead of this script's scope, silently discarding everything the module defines the
+# moment the function returns.
 
-$script:Modules = @(
-    'BackStar.Theme.ps1'
-    'BackStar.Config.ps1'
-    'BackStar.Engine.ps1'
-    'BackStar.UI.ProjectTab.ps1'
-)
-foreach ($m in $script:Modules) {
-    $modPath = Join-Path $PSScriptRoot $m
+function Resolve-BackStarModulePath([string]$Name) {
+    $modPath = Join-Path $PSScriptRoot $Name
     if (-not (Test-Path -LiteralPath $modPath)) {
         [System.Windows.Forms.MessageBox]::Show(
             "BackStar is missing a required file and cannot start:`n$modPath`n`nReinstall/redownload the BackStar folder so all files stay together.",
             'BackStar - Missing File', 'OK', 'Error') | Out-Null
         exit 1
     }
-    . $modPath
+    return $modPath
 }
+
+. (Resolve-BackStarModulePath 'BackStar.Theme.ps1')
+. (Resolve-BackStarModulePath 'BackStar.Config.ps1')
+. (Resolve-BackStarModulePath 'BackStar.Engine.ps1')
+
+# ---------- form shell ----------
+
+$form = New-Object System.Windows.Forms.Form
+$form.Text = 'BackStar - Backup Utility'
+$form.ClientSize = New-Object System.Drawing.Size(694, 704)
+$form.MinimumSize = New-Object System.Drawing.Size(600, 604)
+$form.StartPosition = 'CenterScreen'
+$form.BackColor = $Theme.BgMain
+$form.Font = $Theme.FontRegular
+
+# --- header: logo + title ---
+
+$picLogo = New-Object System.Windows.Forms.PictureBox
+$picLogo.SizeMode = 'Zoom'
+$picLogo.BackColor = $Theme.BgMain
+if (Test-Path -LiteralPath $script:LogoPath) {
+    try { $picLogo.Image = [System.Drawing.Image]::FromFile($script:LogoPath) } catch { }
+}
+$pnlLogo = New-BorderPanel $picLogo $Theme.AccentBlue 2
+$pnlLogo.Location = New-Object System.Drawing.Point(12, 12)
+$pnlLogo.Size = New-Object System.Drawing.Size(60, 60)
+$form.Controls.Add($pnlLogo)
+
+$lblTitle = New-Object System.Windows.Forms.Label
+$lblTitle.Text = 'BACKSTAR'
+$lblTitle.Font = $Theme.FontHeading
+$lblTitle.ForeColor = $Theme.TextPrimary
+$lblTitle.BackColor = [System.Drawing.Color]::Transparent
+$lblTitle.Location = New-Object System.Drawing.Point(84, 12)
+$lblTitle.AutoSize = $true
+$form.Controls.Add($lblTitle)
+
+$lblSubtitle = New-Object System.Windows.Forms.Label
+$lblSubtitle.Text = 'DUAL BACKUP UTILITY'
+$lblSubtitle.Font = $Theme.FontSubtitle
+$lblSubtitle.ForeColor = $Theme.AccentRed
+$lblSubtitle.BackColor = [System.Drawing.Color]::Transparent
+$lblSubtitle.Location = New-Object System.Drawing.Point(86, 40)
+$lblSubtitle.AutoSize = $true
+$form.Controls.Add($lblSubtitle)
+
+$sepGradient = New-Object System.Windows.Forms.Panel
+$sepGradient.Location = New-Object System.Drawing.Point(12, 80)
+$sepGradient.Size = New-Object System.Drawing.Size(670, 3)
+$sepGradient.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+$sepGradient.Add_Paint({
+    param($s, $e)
+    $rect = $s.ClientRectangle
+    if ($rect.Width -le 0 -or $rect.Height -le 0) { return }
+    $brush = New-Object System.Drawing.Drawing2D.LinearGradientBrush($rect, $Theme.AccentBlue, $Theme.AccentRed, 0.0)
+    $e.Graphics.FillRectangle($brush, $rect)
+    $brush.Dispose()
+})
+$form.Controls.Add($sepGradient)
+
+# --- tab strip: two toggle buttons + a sliding accent indicator underneath ---
+
+$script:TabProjectX = 12
+$script:TabSystemX  = 349
+$script:TabIndicatorX = [double]$script:TabProjectX
+$script:TabIndicatorTargetX = [double]$script:TabProjectX
+
+$btnTabProject = New-ThemedButton 'PROJECT BACKUP' $Theme.BgPanel $Theme.AccentBlue $Theme.BgPanel
+$btnTabProject.FlatAppearance.BorderSize = 0
+$btnTabProject.Location = New-Object System.Drawing.Point($script:TabProjectX, 90)
+$btnTabProject.Size = New-Object System.Drawing.Size(333, 30)
+$btnTabProject.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+$form.Controls.Add($btnTabProject)
+
+$btnTabSystem = New-ThemedButton 'SYSTEM BACKUP' $Theme.BgMain $Theme.TextMuted $Theme.BgMain
+$btnTabSystem.FlatAppearance.BorderSize = 0
+$btnTabSystem.Location = New-Object System.Drawing.Point($script:TabSystemX, 90)
+$btnTabSystem.Size = New-Object System.Drawing.Size(333, 30)
+$btnTabSystem.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+$form.Controls.Add($btnTabSystem)
+
+$pnlTabIndicator = New-Object System.Windows.Forms.Panel
+$pnlTabIndicator.Location = New-Object System.Drawing.Point($script:TabProjectX, 120)
+$pnlTabIndicator.Size = New-Object System.Drawing.Size(333, 3)
+$pnlTabIndicator.BackColor = $Theme.AccentBlue
+$pnlTabIndicator.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left
+$form.Controls.Add($pnlTabIndicator)
+
+# --- tab content: two panels occupying the same rectangle; only one visible at a time ---
+
+$pnlProjectTab = New-Object System.Windows.Forms.Panel
+$pnlProjectTab.Location = New-Object System.Drawing.Point(12, 128)
+$pnlProjectTab.Size = New-Object System.Drawing.Size(670, 260)
+$pnlProjectTab.BackColor = $Theme.BgMain
+$pnlProjectTab.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+$pnlProjectTab.Visible = $true
+$form.Controls.Add($pnlProjectTab)
+
+$pnlSystemTab = New-Object System.Windows.Forms.Panel
+$pnlSystemTab.Location = New-Object System.Drawing.Point(12, 128)
+$pnlSystemTab.Size = New-Object System.Drawing.Size(670, 260)
+$pnlSystemTab.BackColor = $Theme.BgMain
+$pnlSystemTab.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+$pnlSystemTab.Visible = $false
+$form.Controls.Add($pnlSystemTab)
+
+# --- shared: Start/Cancel button, progress bar, status, log (used by whichever tab is running) ---
+
+$btnStart = New-ThemedButton 'Start Backup' $Theme.AccentRed $Theme.TextPrimary $Theme.AccentRed
+$btnStart.Location = New-Object System.Drawing.Point(12, 396)
+$btnStart.Size = New-Object System.Drawing.Size(670, 40)
+$btnStart.Font = New-Object System.Drawing.Font('Consolas', 11, [System.Drawing.FontStyle]::Bold)
+$btnStart.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+$form.Controls.Add($btnStart)
+
+$barPanel = New-Object System.Windows.Forms.Panel
+$barPanel.Location = New-Object System.Drawing.Point(12, 444)
+$barPanel.Size = New-Object System.Drawing.Size(670, 24)
+$barPanel.BackColor = $Theme.BgPanel
+$barPanel.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+$dbProp = [System.Windows.Forms.Control].GetProperty('DoubleBuffered', ([System.Reflection.BindingFlags]::Instance -bor [System.Reflection.BindingFlags]::NonPublic))
+$dbProp.SetValue($barPanel, $true, $null)
+$barPanel.Add_Paint({
+    param($s, $e)
+    $g = $e.Graphics
+    $w = $s.ClientSize.Width
+    $h = $s.ClientSize.Height
+    if ($w -le 2 -or $h -le 2) { return }
+
+    $bgBrush = New-Object System.Drawing.SolidBrush($Theme.BgPanel)
+    $g.FillRectangle($bgBrush, 0, 0, $w, $h)
+    $bgBrush.Dispose()
+
+    $fillW = 0
+    if ($script:BarState -eq 'done') {
+        $fillW = $w
+    }
+    elseif ($script:BarState -eq 'scanning') {
+        $fillW = 0
+    }
+    elseif ($script:TotalJobs -gt 0) {
+        $fillW = [int]($w * $script:DoneJobs / $script:TotalJobs)
+    }
+    if ($fillW -gt 0) {
+        $fb = New-Object System.Drawing.SolidBrush($Theme.BarFill)
+        $g.FillRectangle($fb, 0, 0, $fillW, $h)
+        $fb.Dispose()
+    }
+
+    if (($script:BarState -eq 'running' -or $script:BarState -eq 'scanning') -and $fillW -lt $w) {
+        $regionW = $w - $fillW
+        $bandW = 110
+        $span = $regionW + $bandW
+        $pos = $fillW + (([int]$script:AnimPhase) % $span) - $bandW
+        $clip = New-Object System.Drawing.Rectangle($fillW, 0, $regionW, $h)
+        $g.SetClip($clip)
+        $bandRect = New-Object System.Drawing.Rectangle($pos, 0, $bandW, $h)
+        $lg = New-Object System.Drawing.Drawing2D.LinearGradientBrush($bandRect, $Theme.AccentBlue, $Theme.AccentBlue, 0.0)
+        $cb = New-Object System.Drawing.Drawing2D.ColorBlend(3)
+        $cb.Colors = @(
+            [System.Drawing.Color]::FromArgb(0, 0, 200, 255),
+            [System.Drawing.Color]::FromArgb(120, 0, 200, 255),
+            [System.Drawing.Color]::FromArgb(0, 0, 200, 255)
+        )
+        $cb.Positions = @([single]0.0, [single]0.5, [single]1.0)
+        $lg.InterpolationColors = $cb
+        $g.FillRectangle($lg, $bandRect)
+        $lg.Dispose()
+        $g.ResetClip()
+    }
+
+    $pen = New-Object System.Drawing.Pen($Theme.AccentBlue)
+    $g.DrawRectangle($pen, 0, 0, $w - 1, $h - 1)
+    $pen.Dispose()
+
+    $text = ''
+    $textColor = $Theme.TextMuted
+    switch ($script:BarState) {
+        'running'   {
+            $elapsed = if ($script:JobStart) { ((Get-Date) - $script:JobStart).ToString('mm\:ss') } else { '00:00' }
+            $queuePos = "[$([Math]::Min($script:DoneJobs + 1, $script:TotalJobs))/$($script:TotalJobs)]"
+            if ($script:CurrentKind -eq 'gc') {
+                $text = "$queuePos GIT GC $($script:CurrentName)  ::  $elapsed"
+            }
+            else {
+                $fileBit = ''
+                if ($script:CurrentFile) {
+                    $leaf = Split-Path $script:CurrentFile -Leaf
+                    $fileBit = "  ::  $leaf$($script:CurrentPct)"
+                }
+                $text = "$queuePos SYNCING $($script:CurrentName)  ::  $($script:FilesCopied) FILES$fileBit  ::  $elapsed"
+            }
+            $textColor = $Theme.TextPrimary
+        }
+        'scanning'  { $text = 'SCANNING FOLDER SIZES...'; $textColor = $Theme.TextPrimary }
+        'done'      { $text = "COMPLETE  ::  $($script:TotalFilesCopied) FILES"; $textColor = $Theme.TextPrimary }
+        'cancelled' { $text = 'CANCELLED'; $textColor = $Theme.AccentAmber }
+        default     { $text = 'STANDBY' }
+    }
+    $tf = [System.Windows.Forms.TextFormatFlags]::HorizontalCenter -bor
+          [System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor
+          [System.Windows.Forms.TextFormatFlags]::EndEllipsis
+    [System.Windows.Forms.TextRenderer]::DrawText($g, $text, $Theme.FontBar, $s.ClientRectangle, $textColor, $tf)
+})
+$form.Controls.Add($barPanel)
+
+$lblStatus = New-Object System.Windows.Forms.Label
+$lblStatus.Text = '> Ready.'
+$lblStatus.ForeColor = $Theme.TextMuted
+$lblStatus.Font = $Theme.FontRegular
+$lblStatus.Location = New-Object System.Drawing.Point(12, 474)
+$lblStatus.Size = New-Object System.Drawing.Size(670, 18)
+$lblStatus.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+$form.Controls.Add($lblStatus)
+
+$lblLog = New-Object System.Windows.Forms.Label
+$lblLog.Text = 'ACTIVITY LOG'
+$lblLog.Font = $Theme.FontBold
+$lblLog.ForeColor = $Theme.AccentBlue
+$lblLog.Location = New-Object System.Drawing.Point(12, 498)
+$lblLog.AutoSize = $true
+$form.Controls.Add($lblLog)
+
+$txtLog = New-Object System.Windows.Forms.RichTextBox
+$txtLog.BackColor = $Theme.BgPanel
+$txtLog.ForeColor = $Theme.TextPrimary
+$txtLog.BorderStyle = 'None'
+$txtLog.ReadOnly = $true
+$txtLog.WordWrap = $false
+$txtLog.ScrollBars = 'ForcedBoth'
+$txtLog.Font = $Theme.FontLog
+$pnlLog = New-BorderPanel $txtLog $Theme.AccentBlue 2
+$pnlLog.Location = New-Object System.Drawing.Point(12, 518)
+$pnlLog.Size = New-Object System.Drawing.Size(670, 174)
+$pnlLog.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right -bor [System.Windows.Forms.AnchorStyles]::Bottom
+$form.Controls.Add($pnlLog)
+Set-DarkScrollbars $txtLog
+
+Set-StartButtonMode $false
+
+# --- window icon (taskbar): prefer a real multi-size .ico built from the logo PNG ---
+
+$script:IconPath = Join-Path $PSScriptRoot 'assets\BackStar.ico'
+if (Test-Path -LiteralPath $script:IconPath) {
+    try { $form.Icon = New-Object System.Drawing.Icon($script:IconPath) } catch { }
+}
+elseif (Test-Path -LiteralPath $script:LogoPath) {
+    try {
+        $iconBmp = New-Object System.Drawing.Bitmap($script:LogoPath)
+        $form.Icon = [System.Drawing.Icon]::FromHandle($iconBmp.GetHicon())
+    }
+    catch { }
+}
+
+# ---------- tab modules ----------
+# Each populates its own panel and defines a Start-<Profile>BackupRun function that the shared
+# Start/Cancel button below dispatches to based on $script:ActiveTab.
+
+. (Resolve-BackStarModulePath 'BackStar.UI.ProjectTab.ps1')
+. (Resolve-BackStarModulePath 'BackStar.UI.SystemTab.ps1')
+
+# ---------- tab switching ----------
+
+$script:TabAnimTimer = New-Object System.Windows.Forms.Timer
+$script:TabAnimTimer.Interval = 15
+$script:TabAnimTimer.Add_Tick({
+    $diff = $script:TabIndicatorTargetX - $script:TabIndicatorX
+    if ([Math]::Abs($diff) -lt 1) {
+        $script:TabIndicatorX = $script:TabIndicatorTargetX
+        $script:TabAnimTimer.Stop()
+    }
+    else {
+        $script:TabIndicatorX += $diff * 0.25
+    }
+    $pnlTabIndicator.Location = New-Object System.Drawing.Point([int]$script:TabIndicatorX, 120)
+})
+
+function Set-ActiveTab([string]$tab) {
+    $script:ActiveTab = $tab
+    $isProject = ($tab -eq 'Project')
+    $pnlProjectTab.Visible = $isProject
+    $pnlSystemTab.Visible = -not $isProject
+
+    $btnTabProject.BackColor = if ($isProject) { $Theme.BgPanel } else { $Theme.BgMain }
+    $btnTabProject.ForeColor = if ($isProject) { $Theme.AccentBlue } else { $Theme.TextMuted }
+    $btnTabSystem.BackColor = if ($isProject) { $Theme.BgMain } else { $Theme.BgPanel }
+    $btnTabSystem.ForeColor = if ($isProject) { $Theme.TextMuted } else { $Theme.AccentRed }
+    $pnlTabIndicator.BackColor = if ($isProject) { $Theme.AccentBlue } else { $Theme.AccentRed }
+
+    $script:TabIndicatorTargetX = if ($isProject) { $script:TabProjectX } else { $script:TabSystemX }
+    $script:TabAnimTimer.Start()
+
+    if ($tab -eq 'System' -and -not $script:SystemTabSizeScanStarted) {
+        $script:SystemTabSizeScanStarted = $true
+        Start-FolderSizeScan
+    }
+}
+
+$btnTabProject.Add_Click({ if (-not $script:Running) { Set-ActiveTab 'Project' } })
+$btnTabSystem.Add_Click({ if (-not $script:Running) { Set-ActiveTab 'System' } })
+
+# ---------- shared Start/Cancel dispatch ----------
+
+$btnStart.Add_Click({
+    if ($script:Running) {
+        $script:Cancelled = $true
+        Append-Log 'Cancelling...' 'Warn'
+        $btnStart.Enabled = $false
+        Stop-CurrentProcess
+        return
+    }
+    if ($script:ActiveTab -eq 'Project') { Start-ProjectBackupRun } else { Start-SystemBackupRun }
+})
+
+# ---------- shared window events ----------
+
+$form.Add_FormClosing({
+    param($s, $e)
+    if ($script:Running) {
+        $r = Show-ThemedDialog -Message 'A backup is still running. Stop it and exit?' -Title 'BackStar' -Buttons YesNo -Kind Warn
+        if ($r -ne [System.Windows.Forms.DialogResult]::Yes) {
+            $e.Cancel = $true
+            return
+        }
+        $script:Cancelled = $true
+        $script:Running = $false
+        $script:Timer.Stop()
+        $script:AnimTimer.Stop()
+        Stop-CurrentProcess
+        if ($script:CurrentJob) {
+            Remove-Item -LiteralPath $script:CurrentJob.LogPath -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $script:CurrentJob.ErrLogPath -ErrorAction SilentlyContinue
+        }
+    }
+    Save-Config
+})
+
+$form.Add_Shown({
+    $form.Activate()
+    Set-DarkTitleBar $form
+})
 
 Load-Config
 
