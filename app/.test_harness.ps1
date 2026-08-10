@@ -1,9 +1,9 @@
 # Test harness: pulls Read-NewLogText, Update-ProgressFromTail and Process-LogChunk out of
-# BackStar.ps1 via AST, stubs the UI bits they touch, then simulates timer ticks against a
+# BackStar.Engine.ps1 via AST, stubs the UI bits they touch, then simulates timer ticks against a
 # live robocopy run to verify progress parsing end to end.
 $ErrorActionPreference = 'Stop'
 
-$ast = [System.Management.Automation.Language.Parser]::ParseFile('E:\BackStar\BackStar.ps1', [ref]$null, [ref]$null)
+$ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'BackStar.Engine.ps1'), [ref]$null, [ref]$null)
 $wanted = 'Read-NewLogText', 'Update-ProgressFromTail', 'Process-LogChunk'
 foreach ($name in $wanted) {
     $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $false)
