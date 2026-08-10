@@ -177,6 +177,68 @@ function Stop-CurrentProcess {
     }
 }
 
+function Get-RobocopyArgs {
+    # Shared by every copy job (Project Backup, System Backup, Restore): only what varies between
+    # them is parameterized. Mirror=true keeps today's /MIR (purges dest files no longer in source);
+    # Mirror=false uses /E instead - plain recursive copy, robocopy's own timestamp/size compare
+    # still skips unchanged files, but nothing at the destination is ever deleted.
+    param(
+        [string]$Source,
+        [string]$Dest,
+        [bool]$Mirror,
+        [string[]]$ExcludeDirNames = @(),
+        [string[]]$ExcludeDirPaths = @(),
+        [string[]]$ExcludeFilePatterns = @()
+    )
+    $xd = ''
+    if ($ExcludeDirNames.Count -gt 0 -or $ExcludeDirPaths.Count -gt 0) {
+        $parts = New-Object System.Collections.Generic.List[string]
+        foreach ($n in $ExcludeDirNames) { $parts.Add($n) }
+        foreach ($rel in $ExcludeDirPaths) {
+            # Full paths go to /XD quoted; robocopy matches them against the source tree exactly.
+            $parts.Add("`"$(Join-Path $Source $rel)`"")
+        }
+        $xd = ' /XD ' + ($parts -join ' ')
+    }
+    $xf = ''
+    if ($ExcludeFilePatterns.Count -gt 0) {
+        $xf = ' /XF ' + ($ExcludeFilePatterns -join ' ')
+    }
+    $mirrorFlag = if ($Mirror) { '/MIR' } else { '/E' }
+    # /FFT: 2-second timestamp tolerance so exFAT/FAT32 USB targets don't recopy everything each run.
+    # /DST: tolerate the 1-hour daylight-saving skew. /NDL: skip directory lines (files show full paths).
+    # Per-file progress stays ON (no /NP) so the UI can show live % while big files copy to slow USB targets.
+    return "`"$Source`" `"$Dest`" $mirrorFlag$xd$xf /XJ /FFT /DST /NDL /R:2 /W:2 /MT:8"
+}
+
+function New-CopyJob {
+    param(
+        [string]$Name,
+        [string]$Source,
+        [string]$Dest,
+        [bool]$Mirror,
+        [string]$BackupProfile = 'Project',
+        [string[]]$ExcludeDirNames = @(),
+        [string[]]$ExcludeDirPaths = @(),
+        [string[]]$ExcludeFilePatterns = @()
+    )
+    return [PSCustomObject]@{
+        Name                = $Name
+        Source              = $Source
+        Dest                = $Dest
+        Kind                = 'copy'
+        Mirror              = $Mirror
+        BackupProfile       = $BackupProfile
+        ExcludeDirNames     = $ExcludeDirNames
+        ExcludeDirPaths     = $ExcludeDirPaths
+        ExcludeFilePatterns = $ExcludeFilePatterns
+    }
+}
+
+function New-GcJob([string]$Name, [string]$Source, [string]$BackupProfile = 'Project') {
+    return [PSCustomObject]@{ Name = $Name; Source = $Source; Dest = $null; Kind = 'gc'; Mirror = $true; BackupProfile = $BackupProfile }
+}
+
 function Start-NextJob {
     if ($script:Cancelled -or $script:JobQueue.Count -eq 0) {
         Finish-Run
@@ -204,16 +266,9 @@ function Start-NextJob {
         Append-Log "Repo: $($job.Source)" 'Muted'
     }
     else {
-        $excludeStr = $script:ExcludeDirs -join ' '
-        foreach ($rel in $script:ExcludePaths) {
-            # Full paths go to /XD quoted; robocopy matches them against the source tree exactly.
-            $excludeStr += " `"$(Join-Path $job.Source $rel)`""
-        }
-        # /FFT: 2-second timestamp tolerance so exFAT/FAT32 USB targets don't recopy everything each run.
-        # /DST: tolerate the 1-hour daylight-saving skew. /NDL: skip directory lines (files show full paths).
-        # Per-file progress stays ON (no /NP) so the UI can show live % while big files copy to slow USB targets.
         $exePath = 'robocopy.exe'
-        $argStr = "`"$($job.Source)`" `"$($job.Dest)`" /MIR /XD $excludeStr /XJ /FFT /DST /NDL /R:2 /W:2 /MT:8"
+        $argStr = Get-RobocopyArgs -Source $job.Source -Dest $job.Dest -Mirror $job.Mirror `
+            -ExcludeDirNames $job.ExcludeDirNames -ExcludeDirPaths $job.ExcludeDirPaths -ExcludeFilePatterns $job.ExcludeFilePatterns
         $lblStatus.Text = "> Backing up $($script:DoneJobs + 1) of $($script:TotalJobs): $($job.Name)"
         Append-Log ''
         Append-Log "===== $($job.Name) =====" 'Header'

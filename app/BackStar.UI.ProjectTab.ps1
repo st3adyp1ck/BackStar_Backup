@@ -393,7 +393,8 @@ $btnStart.Add_Click({
                 return
             }
 
-            $jobs.Add([PSCustomObject]@{ Name = $name; Source = $srcFull; Dest = $destSub; Kind = 'copy' })
+            $jobs.Add((New-CopyJob -Name $name -Source $srcFull -Dest $destSub -Mirror $true -BackupProfile 'Project' `
+                -ExcludeDirNames $script:ExcludeDirs -ExcludeDirPaths $script:ExcludePaths))
         }
 
         if ($jobs.Count -eq 0) {
@@ -416,7 +417,7 @@ $btnStart.Add_Click({
         foreach ($j in $jobs) {
             if ($chkGitGc.Checked -and $gitAvailable -and
                 (Test-Path -LiteralPath (Join-Path $j.Source '.git') -PathType Container)) {
-                $script:JobQueue.Enqueue([PSCustomObject]@{ Name = $j.Name; Source = $j.Source; Dest = $null; Kind = 'gc' })
+                $script:JobQueue.Enqueue((New-GcJob -Name $j.Name -Source $j.Source -BackupProfile 'Project'))
                 $gitGcQueued++
             }
             $script:JobQueue.Enqueue($j)
