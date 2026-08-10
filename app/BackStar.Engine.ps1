@@ -335,7 +335,14 @@ function Finish-Run {
     if ($script:Cancelled) {
         Append-Log ''
         Append-Log 'Backup cancelled.' 'Warn'
-        Show-ThemedDialog -Message 'Backup was cancelled.' -Title 'BackStar' -Buttons OK -Kind Warn | Out-Null
+        # A dialog owned by a hidden/minimized-to-tray parent is a trap the user can't easily
+        # get back to - skip it and rely on the balloon instead when the window isn't visible.
+        if ($form.Visible) {
+            Show-ThemedDialog -Message 'Backup was cancelled.' -Title 'BackStar' -Buttons OK -Kind Warn | Out-Null
+        }
+        else {
+            Show-BackupNotification 'BackStar' 'Backup was cancelled.' 'Warn'
+        }
         return
     }
 
@@ -350,7 +357,13 @@ function Finish-Run {
         $summaryMsg += "`n$failCount failed - check the log for details."
         $kind = 'Error'
     }
-    Show-ThemedDialog -Message $summaryMsg -Title 'BackStar - Backup Complete' -Buttons OK -Kind $kind | Out-Null
+
+    if ($form.Visible) {
+        Show-ThemedDialog -Message $summaryMsg -Title 'BackStar - Backup Complete' -Buttons OK -Kind $kind | Out-Null
+    }
+    else {
+        Show-BackupNotification 'BackStar - Backup Complete' $summaryMsg $kind
+    }
 }
 
 # ---------- timers ----------

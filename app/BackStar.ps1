@@ -81,6 +81,7 @@ function Resolve-BackStarModulePath([string]$Name) {
 . (Resolve-BackStarModulePath 'BackStar.Theme.ps1')
 . (Resolve-BackStarModulePath 'BackStar.Config.ps1')
 . (Resolve-BackStarModulePath 'BackStar.Engine.ps1')
+. (Resolve-BackStarModulePath 'BackStar.Tray.ps1')
 
 # ---------- form shell ----------
 
@@ -331,6 +332,8 @@ elseif (Test-Path -LiteralPath $script:LogoPath) {
     catch { }
 }
 
+Initialize-TrayIcon
+
 # ---------- tab modules ----------
 # Each populates its own panel and defines a Start-<Profile>BackupRun function that the shared
 # Start/Cancel button below dispatches to based on $script:ActiveTab.
@@ -412,6 +415,10 @@ $form.Add_FormClosing({
         }
     }
     Save-Config
+    if ($script:TrayIcon) {
+        $script:TrayIcon.Visible = $false
+        $script:TrayIcon.Dispose()
+    }
 })
 
 $form.Add_Shown({
