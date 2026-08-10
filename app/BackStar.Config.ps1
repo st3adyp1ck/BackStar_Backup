@@ -124,16 +124,18 @@ function Load-Config {
 
             # System Backup settings are additive/optional - old config files (or a first run)
             # simply won't have this key, and everything below just no-ops/falls back to defaults.
-            $hadSystemPresetConfig = $false
+            #
+            # Presence of the SystemBackup block itself - not the truthiness of EnabledPresets -
+            # is what marks "this has been saved before". A user who deliberately unchecks every
+            # preset produces EnabledPresets: [], which is falsy just like "key never existed";
+            # keying off $sb instead means that legitimate empty selection is respected on reload
+            # instead of being silently overwritten back to "check everything found".
             $sb = $cfg.SystemBackup
             if ($sb) {
                 if ($sb.Destination) { $txtSystemDest.Text = Resolve-StoredDestination $sb.Destination }
-                if ($sb.EnabledPresets) {
-                    $hadSystemPresetConfig = $true
-                    $enabled = @($sb.EnabledPresets)
-                    foreach ($item in $lvCategories.Items) {
-                        $item.Checked = ($enabled -contains $item.Tag.Key)
-                    }
+                $enabled = @($sb.EnabledPresets)
+                foreach ($item in $lvCategories.Items) {
+                    $item.Checked = ($enabled -contains $item.Tag.Key)
                 }
                 if ($sb.CustomSources) {
                     foreach ($p in @($sb.CustomSources)) {
@@ -143,7 +145,7 @@ function Load-Config {
                     }
                 }
             }
-            if (-not $hadSystemPresetConfig) {
+            else {
                 # First run, or an older config from before System Backup existed: default to
                 # every preset actually found on this machine rather than starting empty.
                 foreach ($item in $lvCategories.Items) {

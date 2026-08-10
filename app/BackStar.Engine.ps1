@@ -125,6 +125,12 @@ function Process-LogChunk([string]$text) {
             $tabIdx = $clean.LastIndexOf("`t")
             if ($tabIdx -ge 0 -and $tabIdx -lt $clean.Length - 1) {
                 $script:CurrentFile = $clean.Substring($tabIdx + 1).Trim()
+                # Robocopy reports the destination-side path here. Recorded now (while we already
+                # have it) so the post-copy verification pass has concrete paths to check, without
+                # a second directory walk.
+                if ($script:CurrentJob -and $script:CurrentJob.CopiedFiles) {
+                    $script:CurrentJob.CopiedFiles.Add($script:CurrentFile)
+                }
             }
             $script:CurrentPct = ''
         }
@@ -142,15 +148,44 @@ function Process-LogChunk([string]$text) {
     if ($script:CurrentJob -and $script:CurrentJob.Job -and ($null -ne $script:CurrentJob.Job.Mirror)) {
         $mirrorRun = [bool]$script:CurrentJob.Job.Mirror
     }
+    $extraColor = if ($mirrorRun) { 'Warn' } else { 'Muted' }
     foreach ($ln in $shown) {
         if ($ln -match '\bERROR\b') { Append-Log $ln 'Error' }
-        elseif ($ln -match '\*EXTRA') { Append-Log $ln (if ($mirrorRun) { 'Warn' } else { 'Muted' }) }
+        elseif ($ln -match '\*EXTRA') { Append-Log $ln $extraColor }
         else { Append-Log $ln 'Muted' }
     }
     if ($lines.Count -gt $max) {
         Append-Log ("    ... +{0} more lines" -f ($lines.Count - $max)) 'Muted'
     }
     Trim-LogBox
+}
+
+function Test-CopiedFilesIntegrity {
+    # Metadata-only check (size + timestamp, same 2-second tolerance robocopy itself uses via
+    # /FFT) against the files this job actually reported copying - not a full-tree re-walk, and
+    # cheap enough to run inline on the UI thread right after the job's process exits.
+    param($Job, [System.Collections.Generic.List[string]]$DestPaths)
+    $mismatches = New-Object System.Collections.Generic.List[string]
+    foreach ($destPath in $DestPaths) {
+        try {
+            if (-not $destPath.StartsWith($Job.Dest, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+            $relative = $destPath.Substring($Job.Dest.Length).TrimStart('\')
+            $srcPath = Join-Path $Job.Source $relative
+            if (-not (Test-Path -LiteralPath $destPath -PathType Leaf) -or -not (Test-Path -LiteralPath $srcPath -PathType Leaf)) {
+                $mismatches.Add("$relative (missing at source or destination)")
+                continue
+            }
+            $destInfo = Get-Item -LiteralPath $destPath
+            $srcInfo = Get-Item -LiteralPath $srcPath
+            $sizeDiffers = $destInfo.Length -ne $srcInfo.Length
+            $timeDiffers = [Math]::Abs(($destInfo.LastWriteTimeUtc - $srcInfo.LastWriteTimeUtc).TotalSeconds) -gt 2
+            if ($sizeDiffers -or $timeDiffers) {
+                $mismatches.Add($relative)
+            }
+        }
+        catch { }
+    }
+    return $mismatches
 }
 
 function Set-UiEnabled([bool]$enabled) {
@@ -323,11 +358,12 @@ function Start-NextJob {
         $null = $proc.Handle
 
         $script:CurrentJob = [PSCustomObject]@{
-            Job        = $job
-            Process    = $proc
-            LogPath    = $logPath
-            ErrLogPath = $errLogPath
-            ReadOffset = [long]0
+            Job         = $job
+            Process     = $proc
+            LogPath     = $logPath
+            ErrLogPath  = $errLogPath
+            ReadOffset  = [long]0
+            CopiedFiles = (New-Object System.Collections.Generic.List[string])
         }
     }
     catch {
@@ -371,17 +407,23 @@ function Finish-Run {
     $okCount = ($script:ResultsSummary | Where-Object { $_ -like 'OK *' -and $_ -notlike 'OK gc:*' }).Count
     $failCount = ($script:ResultsSummary | Where-Object { $_ -like 'FAIL *' }).Count
     Append-Log ''
-    Append-Log "===== Backup complete: $okCount succeeded, $failCount failed, $($script:TotalFilesCopied) file(s) copied =====" 'Header'
+    $verifyBit = if ($script:VerifyMismatches -gt 0) { ", $($script:VerifyMismatches) verify mismatch(es)" } else { '' }
+    Append-Log "===== Backup complete: $okCount succeeded, $failCount failed, $($script:TotalFilesCopied) file(s) copied$verifyBit =====" 'Header'
 
+    $resultText = if ($failCount -gt 0) { 'Failed' } elseif ($script:VerifyMismatches -gt 0) { "OK ($($script:VerifyMismatches) verify mismatches)" } else { 'OK' }
     Add-HistoryEntry -BackupProfile $script:RunProfile -StartedAt $script:RunStart -DurationSeconds $durationSeconds `
         -FilesCopied $script:TotalFilesCopied -OkCount $okCount -FailCount $failCount -Destination $script:RunDestination `
-        -Result $(if ($failCount -gt 0) { 'Failed' } else { 'OK' })
+        -Result $resultText
 
     $summaryMsg = "$okCount of $($script:TotalCopyJobs) folder(s) backed up successfully.`n$($script:TotalFilesCopied) file(s) copied or updated."
     $kind = 'Info'
     if ($failCount -gt 0) {
         $summaryMsg += "`n$failCount failed - check the log for details."
         $kind = 'Error'
+    }
+    if ($script:VerifyMismatches -gt 0) {
+        $summaryMsg += "`n$($script:VerifyMismatches) file(s) failed post-copy verification - check the log for details."
+        if ($kind -eq 'Info') { $kind = 'Error' }
     }
 
     if ($form.Visible) {
@@ -450,6 +492,14 @@ $script:Timer.Add_Tick({
                     Append-Log "Done: $($job.Name) - $($script:FilesCopied) file(s) in $elapsedStr" 'Success'
                 }
                 $script:ResultsSummary.Add("OK $($job.Name)")
+
+                if ($job.Kind -eq 'copy' -and $script:CurrentJob.CopiedFiles.Count -gt 0) {
+                    $mismatches = Test-CopiedFilesIntegrity $job $script:CurrentJob.CopiedFiles
+                    if ($mismatches.Count -gt 0) {
+                        $script:VerifyMismatches += $mismatches.Count
+                        foreach ($m in $mismatches) { Append-Log "VERIFY MISMATCH: $m" 'Error' }
+                    }
+                }
             }
             else {
                 Append-Log "FAILED: $($job.Name) (robocopy exit code $code)" 'Error'

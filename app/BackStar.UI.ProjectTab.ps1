@@ -219,6 +219,7 @@ function Start-ProjectBackupRun {
         $script:DoneJobs = 0
         $script:TotalFilesCopied = 0
         $script:FilesCopied = 0
+        $script:VerifyMismatches = 0
         $script:AnimPhase = 0
         $script:BarState = 'running'
         $barPanel.Invalidate()

@@ -57,6 +57,7 @@ $script:TotalFilesCopied = 0       # files copied across the whole run
 $script:JobStart     = $null
 $script:CurrentFile  = ''          # file robocopy is currently copying (leaf shown in the bar)
 $script:CurrentPct   = ''          # live per-file progress, e.g. ' 47%' (empty when unknown)
+$script:VerifyMismatches = 0       # post-copy verification failures across the whole run
 $script:ActiveTab    = 'Project'   # 'Project' | 'System' - which tab's config Start/Cancel acts on
 
 # ---------- module loading ----------
