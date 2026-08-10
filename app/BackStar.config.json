@@ -1,0 +1,8 @@
+﻿{
+    "Destination":  ".\\Backups",
+    "Sources":  [
+                    "D:\\Dev-Ops\\CoBo",
+                    "D:\\Dev-Ops\\DarkHorse\\DarkHorse_Main"
+                ],
+    "GitGc":  true
+}
