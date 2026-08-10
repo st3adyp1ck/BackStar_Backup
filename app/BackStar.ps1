@@ -683,6 +683,14 @@ $chkGitGc.Font = $Theme.FontRegular
 $chkGitGc.Location = New-Object System.Drawing.Point(12, 326)
 $chkGitGc.Size = New-Object System.Drawing.Size(670, 22)
 $chkGitGc.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+$chkGitGc.Cursor = [System.Windows.Forms.Cursors]::Hand
+# Checked state uses AccentRed so it's actually visible against the dark background (was TextMuted
+# for both states, which made a checked box nearly impossible to see at a glance).
+$chkGitGc.Add_CheckedChanged({
+    $chkGitGc.ForeColor = if ($chkGitGc.Checked) { $Theme.AccentRed } else { $Theme.TextMuted }
+})
+$chkGitGc.Add_MouseEnter({ $chkGitGc.BackColor = Get-ShadedColor $Theme.BgMain 12 })
+$chkGitGc.Add_MouseLeave({ $chkGitGc.BackColor = $Theme.BgMain })
 $form.Controls.Add($chkGitGc)
 
 # --- start / cancel ---
