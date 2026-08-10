@@ -234,6 +234,9 @@ function Start-ProjectBackupRun {
 
         Set-UiEnabled $false
         Set-StartButtonMode $true
+        $script:RunStart = Get-Date
+        $script:RunProfile = 'Project'
+        $script:RunDestination = $destFull
 
         # Timers must start BEFORE the first job: if every job fails to launch, Start-NextJob
         # reaches Finish-Run synchronously, and Finish-Run must be the last thing to touch them.

@@ -164,6 +164,7 @@ function Set-UiEnabled([bool]$enabled) {
     $chkGitGc.Enabled          = $enabled
     $btnTabProject.Enabled     = $enabled
     $btnTabSystem.Enabled      = $enabled
+    $btnHistory.Enabled        = $enabled
     if ($lvCategories) {
         $lvCategories.Enabled         = $enabled
         $btnSelectAll.Enabled         = $enabled
@@ -332,9 +333,13 @@ function Finish-Run {
     $script:BarState = if ($script:Cancelled) { 'cancelled' } else { 'done' }
     $barPanel.Invalidate()
 
+    $durationSeconds = if ($script:RunStart) { [int]((Get-Date) - $script:RunStart).TotalSeconds } else { 0 }
+
     if ($script:Cancelled) {
         Append-Log ''
         Append-Log 'Backup cancelled.' 'Warn'
+        Add-HistoryEntry -BackupProfile $script:RunProfile -StartedAt $script:RunStart -DurationSeconds $durationSeconds `
+            -FilesCopied $script:TotalFilesCopied -OkCount $script:DoneJobs -FailCount 0 -Destination $script:RunDestination -Result 'Cancelled'
         # A dialog owned by a hidden/minimized-to-tray parent is a trap the user can't easily
         # get back to - skip it and rely on the balloon instead when the window isn't visible.
         if ($form.Visible) {
@@ -350,6 +355,10 @@ function Finish-Run {
     $failCount = ($script:ResultsSummary | Where-Object { $_ -like 'FAIL *' }).Count
     Append-Log ''
     Append-Log "===== Backup complete: $okCount succeeded, $failCount failed, $($script:TotalFilesCopied) file(s) copied =====" 'Header'
+
+    Add-HistoryEntry -BackupProfile $script:RunProfile -StartedAt $script:RunStart -DurationSeconds $durationSeconds `
+        -FilesCopied $script:TotalFilesCopied -OkCount $okCount -FailCount $failCount -Destination $script:RunDestination `
+        -Result $(if ($failCount -gt 0) { 'Failed' } else { 'OK' })
 
     $summaryMsg = "$okCount of $($script:TotalCopyJobs) folder(s) backed up successfully.`n$($script:TotalFilesCopied) file(s) copied or updated."
     $kind = 'Info'

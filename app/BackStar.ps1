@@ -37,6 +37,7 @@ $script:SystemExcludeDirs = @(
 $script:SystemExcludeFiles = @('Thumbs.db', 'desktop.ini', '*.tmp')
 
 $script:ConfigPath   = Join-Path $PSScriptRoot 'BackStar.config.json'
+$script:HistoryPath  = Join-Path $PSScriptRoot 'BackStar.history.json'
 $script:LogoPath     = Join-Path $PSScriptRoot 'assets\BackStar-logo.png'
 $script:MissingTag   = '[missing] '
 $script:Running      = $false
@@ -82,6 +83,7 @@ function Resolve-BackStarModulePath([string]$Name) {
 . (Resolve-BackStarModulePath 'BackStar.Config.ps1')
 . (Resolve-BackStarModulePath 'BackStar.Engine.ps1')
 . (Resolve-BackStarModulePath 'BackStar.Tray.ps1')
+. (Resolve-BackStarModulePath 'BackStar.UI.HistoryRestore.ps1')
 
 # ---------- form shell ----------
 
@@ -123,6 +125,12 @@ $lblSubtitle.BackColor = [System.Drawing.Color]::Transparent
 $lblSubtitle.Location = New-Object System.Drawing.Point(86, 40)
 $lblSubtitle.AutoSize = $true
 $form.Controls.Add($lblSubtitle)
+
+$btnHistory = New-ThemedButton 'History' $Theme.BgPanel $Theme.AccentBlue $Theme.AccentBlue
+$btnHistory.Location = New-Object System.Drawing.Point(578, 18)
+$btnHistory.Size = New-Object System.Drawing.Size(104, 26)
+$btnHistory.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
+$form.Controls.Add($btnHistory)
 
 $sepGradient = New-Object System.Windows.Forms.Panel
 $sepGradient.Location = New-Object System.Drawing.Point(12, 80)
@@ -380,6 +388,8 @@ function Set-ActiveTab([string]$tab) {
 
 $btnTabProject.Add_Click({ if (-not $script:Running) { Set-ActiveTab 'Project' } })
 $btnTabSystem.Add_Click({ if (-not $script:Running) { Set-ActiveTab 'System' } })
+
+$btnHistory.Add_Click({ if (-not $script:Running) { Show-HistoryDialog } })
 
 # ---------- shared Start/Cancel dispatch ----------
 

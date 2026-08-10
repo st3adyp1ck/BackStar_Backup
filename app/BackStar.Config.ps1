@@ -31,6 +31,52 @@ function Resolve-StoredDestination([string]$stored) {
     return $stored
 }
 
+function Get-BackupHistory {
+    # Kept in its own sidecar file, deliberately separate from BackStar.config.json, so a large
+    # or corrupt history file can never break settings loading (and vice versa).
+    if (-not (Test-Path -LiteralPath $script:HistoryPath)) { return @() }
+    try {
+        $raw = Get-Content -LiteralPath $script:HistoryPath -Raw | ConvertFrom-Json
+        return @($raw)
+    }
+    catch {
+        return @()
+    }
+}
+
+function Add-HistoryEntry {
+    param(
+        [string]$BackupProfile,
+        [datetime]$StartedAt,
+        [int]$DurationSeconds,
+        [int]$FilesCopied,
+        [int]$OkCount,
+        [int]$FailCount,
+        [string]$Destination,
+        [string]$Result
+    )
+    $entries = New-Object System.Collections.Generic.List[object]
+    $entries.AddRange(@(Get-BackupHistory))
+    $entries.Add([PSCustomObject]@{
+        Timestamp       = $StartedAt.ToString('o')
+        Profile         = $BackupProfile
+        DurationSeconds = $DurationSeconds
+        FilesCopied     = $FilesCopied
+        OkCount         = $OkCount
+        FailCount       = $FailCount
+        Destination     = $Destination
+        Result          = $Result
+    })
+    # Cap growth: keep only the most recent 200 runs.
+    $keep = if ($entries.Count -gt 200) { $entries.GetRange($entries.Count - 200, 200) } else { $entries }
+    try {
+        $keep | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:HistoryPath -Encoding UTF8
+    }
+    catch {
+        Append-Log "Warning: could not save backup history ($($_.Exception.Message))." 'Warn'
+    }
+}
+
 function Get-SystemPresetDefinitions {
     # Ordered {Key, Label, Path, Found} list backing the System Backup checklist. Path is resolved
     # fresh every launch via well-known folder APIs (never persisted) so config stays portable
