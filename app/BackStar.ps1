@@ -17,8 +17,15 @@ public static class BackStarNative {
     public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref uint attrValue, int attrSize);
     [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
     public static extern int SetWindowTheme(IntPtr hWnd, string pszSubAppName, string pszSubIdList);
+    [DllImport("shell32.dll")]
+    public static extern int SetCurrentProcessExplicitAppUserModelID([MarshalAs(UnmanagedType.LPWStr)] string AppID);
 }
 "@
+
+# Without this, Windows shows the powershell.exe host's own icon on the taskbar button instead of
+# ours (the taskbar/jump-list identity defaults to grouping under "Windows PowerShell" unless the
+# process claims its own distinct App User Model ID) - must be called before any window exists.
+[BackStarNative]::SetCurrentProcessExplicitAppUserModelID('BackStar.BackupUtility') | Out-Null
 
 $script:ExcludeDirs  = @('node_modules', 'dist', 'build', '.next', '__pycache__', '.venv', 'venv', 'target', '.gradle', '.dart_tool', '.expo')
 # Source-relative dirs excluded by full path (matched per source at job start), because their
