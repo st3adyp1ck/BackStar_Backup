@@ -126,6 +126,12 @@ $lblSubtitle.Location = New-Object System.Drawing.Point(86, 40)
 $lblSubtitle.AutoSize = $true
 $form.Controls.Add($lblSubtitle)
 
+$btnRestore = New-ThemedButton 'Restore' $Theme.BgPanel $Theme.AccentBlue $Theme.AccentBlue
+$btnRestore.Location = New-Object System.Drawing.Point(466, 18)
+$btnRestore.Size = New-Object System.Drawing.Size(104, 26)
+$btnRestore.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
+$form.Controls.Add($btnRestore)
+
 $btnHistory = New-ThemedButton 'History' $Theme.BgPanel $Theme.AccentBlue $Theme.AccentBlue
 $btnHistory.Location = New-Object System.Drawing.Point(578, 18)
 $btnHistory.Size = New-Object System.Drawing.Size(104, 26)
@@ -390,6 +396,7 @@ $btnTabProject.Add_Click({ if (-not $script:Running) { Set-ActiveTab 'Project' }
 $btnTabSystem.Add_Click({ if (-not $script:Running) { Set-ActiveTab 'System' } })
 
 $btnHistory.Add_Click({ if (-not $script:Running) { Show-HistoryDialog } })
+$btnRestore.Add_Click({ if (-not $script:Running) { Show-RestoreDialog } })
 
 # ---------- shared Start/Cancel dispatch ----------
 

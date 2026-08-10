@@ -165,6 +165,7 @@ function Set-UiEnabled([bool]$enabled) {
     $btnTabProject.Enabled     = $enabled
     $btnTabSystem.Enabled      = $enabled
     $btnHistory.Enabled        = $enabled
+    $btnRestore.Enabled        = $enabled
     if ($lvCategories) {
         $lvCategories.Enabled         = $enabled
         $btnSelectAll.Enabled         = $enabled
@@ -242,7 +243,8 @@ function New-CopyJob {
         [string]$BackupProfile = 'Project',
         [string[]]$ExcludeDirNames = @(),
         [string[]]$ExcludeDirPaths = @(),
-        [string[]]$ExcludeFilePatterns = @()
+        [string[]]$ExcludeFilePatterns = @(),
+        [switch]$SkipManifest
     )
     return [PSCustomObject]@{
         Name                = $Name
@@ -254,6 +256,7 @@ function New-CopyJob {
         ExcludeDirNames     = $ExcludeDirNames
         ExcludeDirPaths     = $ExcludeDirPaths
         ExcludeFilePatterns = $ExcludeFilePatterns
+        SkipManifest        = [bool]$SkipManifest
     }
 }
 
@@ -293,9 +296,23 @@ function Start-NextJob {
             -ExcludeDirNames $job.ExcludeDirNames -ExcludeDirPaths $job.ExcludeDirPaths -ExcludeFilePatterns $job.ExcludeFilePatterns
         $lblStatus.Text = "> Backing up $($script:DoneJobs + 1) of $($script:TotalJobs): $($job.Name)"
         Append-Log ''
-        Append-Log "===== $($job.Name) =====" 'Header'
+        Append-Log "===== [$($job.BackupProfile)] $($job.Name) =====" 'Header'
         Append-Log "Source:      $($job.Source)" 'Muted'
         Append-Log "Destination: $($job.Dest)" 'Muted'
+
+        # Lets Restore later map a backed-up folder back to where it came from, even if the
+        # source has since been renamed/removed from config. Skipped for Mirror jobs (/MIR would
+        # immediately purge the file right back out as "extra", since it isn't part of the
+        # source tree) and for restore jobs themselves (Source is the backup, not something that
+        # should carry a manifest pointing at itself).
+        if (-not $job.SkipManifest -and -not $job.Mirror) {
+            try {
+                New-Item -ItemType Directory -Path $job.Dest -Force -ErrorAction Stop | Out-Null
+                [PSCustomObject]@{ OriginalSource = $job.Source } | ConvertTo-Json |
+                    Set-Content -LiteralPath (Join-Path $job.Dest '.backstar-manifest.json') -Encoding UTF8
+            }
+            catch { }
+        }
     }
 
     try {
