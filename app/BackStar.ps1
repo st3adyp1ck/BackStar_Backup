@@ -43,6 +43,9 @@ $script:SystemExcludeDirs = @(
 )
 $script:SystemExcludeFiles = @('Thumbs.db', 'desktop.ini', '*.tmp')
 
+# Single source of truth for both the in-app display below and the git tag created for each
+# release (e.g. `git tag v$script:AppVersion`) - bump this alongside tagging a new release.
+$script:AppVersion   = '1.0.0'
 $script:ConfigPath   = Join-Path $PSScriptRoot 'BackStar.config.json'
 $script:HistoryPath  = Join-Path $PSScriptRoot 'BackStar.history.json'
 $script:LogoPath     = Join-Path $PSScriptRoot 'assets\BackStar-logo.png'
@@ -126,7 +129,7 @@ $lblTitle.AutoSize = $true
 $form.Controls.Add($lblTitle)
 
 $lblSubtitle = New-Object System.Windows.Forms.Label
-$lblSubtitle.Text = 'DUAL BACKUP UTILITY'
+$lblSubtitle.Text = "DUAL BACKUP UTILITY - v$($script:AppVersion)"
 $lblSubtitle.Font = $Theme.FontSubtitle
 $lblSubtitle.ForeColor = $Theme.AccentRed
 $lblSubtitle.BackColor = [System.Drawing.Color]::Transparent
