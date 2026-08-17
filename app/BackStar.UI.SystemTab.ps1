@@ -44,10 +44,16 @@ foreach ($p in $script:SystemPresets) {
     $lvCategories.Items.Add($item) | Out-Null
 }
 # A preset that isn't present on this machine can't be checked - ListView items have no per-row
-# Enabled property, so intercept the check instead and silently revert it.
+# Enabled property, so intercept the check instead and silently revert it. Also doubles as the
+# soft-lock for while a run is in progress: $lvCategories itself is kept Enabled (see the comment
+# in Set-UiEnabled for why), so this is what actually blocks toggling a category mid-run.
 $lvCategories.Add_ItemCheck({
     param($s, $e)
     $item = $lvCategories.Items[$e.Index]
+    if ($script:Running) {
+        $e.NewValue = if ($item.Checked) { [System.Windows.Forms.CheckState]::Checked } else { [System.Windows.Forms.CheckState]::Unchecked }
+        return
+    }
     if ($item.Tag -and -not $item.Tag.Found -and $e.NewValue -eq [System.Windows.Forms.CheckState]::Checked) {
         $e.NewValue = [System.Windows.Forms.CheckState]::Unchecked
     }
@@ -289,12 +295,8 @@ function Start-SystemBackupRun {
         $jobs = New-Object System.Collections.Generic.List[object]
         $usedNames = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
 
-        function Test-DestNotInsideSource([string]$destFull, [string]$srcFull) {
-            return -not ($destFull.Equals($srcFull, [System.StringComparison]::OrdinalIgnoreCase) -or
-                $destFull.StartsWith("$srcFull\", [System.StringComparison]::OrdinalIgnoreCase) -or
-                $srcFull.StartsWith("$destFull\", [System.StringComparison]::OrdinalIgnoreCase))
-        }
-
+        # Test-DestNotInsideSource is defined once in BackStar.UI.ProjectTab.ps1 (loaded before
+        # this module) and shared from there rather than duplicated here.
         foreach ($item in $lvCategories.Items) {
             if (-not $item.Checked -or -not $item.Tag.Found) { continue }
             $srcFull = $item.Tag.Path.TrimEnd('\')
@@ -338,42 +340,17 @@ function Start-SystemBackupRun {
         $confirm = Show-ThemedDialog -Message $msg -Title 'Confirm System Backup' -Buttons YesNo -Kind Info
         if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
 
-        Save-Config
-
-        $script:Running = $true
-        $script:Cancelled = $false
-        $script:ResultsSummary = New-Object System.Collections.Generic.List[string]
-        $script:JobQueue = New-Object System.Collections.Generic.Queue[object]
-        foreach ($j in $jobs) { $script:JobQueue.Enqueue($j) }
-        $script:TotalJobs = $script:JobQueue.Count
-        $script:TotalCopyJobs = $jobs.Count
-        $script:DoneJobs = 0
-        $script:TotalFilesCopied = 0
-        $script:FilesCopied = 0
-        $script:VerifyMismatches = 0
-        $script:AnimPhase = 0
-        $script:BarState = 'running'
-        $barPanel.Invalidate()
-
         $txtLog.Clear()
         foreach ($s in $skipped) { Append-Log "Skipping (not found on this machine): $s" 'Warn' }
 
-        Set-UiEnabled $false
-        Set-StartButtonMode $true
-        $script:RunStart = Get-Date
-        $script:RunProfile = 'System'
-        $script:RunDestination = $destFull
-
-        # Timers must start BEFORE the first job: if every job fails to launch, Start-NextJob
-        # reaches Finish-Run synchronously, and Finish-Run must be the last thing to touch them.
-        $script:Timer.Start()
-        $script:AnimTimer.Start()
-        Start-NextJob
+        Start-BackupJobRun -QueueJobs $jobs -CopyJobCount $jobs.Count -RunProfile 'System' -Destination $destFull
     }
     catch {
         Show-ThemedDialog -Message "Unexpected error: $($_.Exception.Message)" -Buttons OK -Kind Error | Out-Null
+        # $script:Running reset BEFORE Set-StartButtonMode - see the matching comment in
+        # BackStar.UI.ProjectTab.ps1's catch blocks for why the order matters.
+        $script:Running = $false
         Set-UiEnabled $true
         Set-StartButtonMode $false
-        $script:Running = $false
     }
 }

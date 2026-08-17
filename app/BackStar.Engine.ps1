@@ -202,7 +202,12 @@ function Set-UiEnabled([bool]$enabled) {
     $btnHistory.Enabled        = $enabled
     $btnRestore.Enabled        = $enabled
     if ($lvCategories) {
-        $lvCategories.Enabled         = $enabled
+        # NOT $lvCategories.Enabled: a disabled ListView ignores its BackColor entirely and
+        # repaints its whole client area near-white (a native WinForms quirk that doesn't affect
+        # Button/ListBox/CheckBox - those dim correctly). Left Enabled so the dark theme holds,
+        # soft-locked instead via dimmed text plus the ItemCheck guard in BackStar.UI.SystemTab.ps1
+        # that reverts any check/uncheck attempted while a run is in progress.
+        $lvCategories.ForeColor       = if ($enabled) { $Theme.TextPrimary } else { $Theme.TextMuted }
         $btnSelectAll.Enabled         = $enabled
         $btnRescanSizes.Enabled       = $enabled
         $lstSystemCustom.Enabled      = $enabled
@@ -227,6 +232,51 @@ function Set-StartButtonMode([bool]$isRunning) {
         $btnStart.FlatAppearance.MouseOverBackColor = Get-ShadedColor $Theme.AccentRed 25
         $btnStart.FlatAppearance.MouseDownBackColor = Get-ShadedColor $Theme.AccentRed -25
     }
+    # Defined in BackStar.ps1 (once both tab modules have loaded); flips which button(s) occupy
+    # the shared action row now that isRunning has changed.
+    Update-ActionRow
+}
+
+function Start-BackupJobRun {
+    # Shared run-bootstrap for the Project tab's Full Backup and Sync flows: queues the jobs,
+    # resets every run counter, locks the UI, and kicks off the timers + first job. Callers are
+    # expected to have already validated input, built $QueueJobs (in the exact order they should
+    # run, gc jobs already interspersed if applicable), cleared/populated the log, and confirmed
+    # the run with the user.
+    param(
+        [System.Collections.Generic.List[object]]$QueueJobs,
+        [int]$CopyJobCount,
+        [string]$RunProfile,
+        [string]$Destination
+    )
+    Save-Config
+
+    $script:Running = $true
+    $script:Cancelled = $false
+    $script:ResultsSummary = New-Object System.Collections.Generic.List[string]
+    $script:JobQueue = New-Object System.Collections.Generic.Queue[object]
+    foreach ($j in $QueueJobs) { $script:JobQueue.Enqueue($j) }
+    $script:TotalJobs = $script:JobQueue.Count
+    $script:TotalCopyJobs = $CopyJobCount
+    $script:DoneJobs = 0
+    $script:TotalFilesCopied = 0
+    $script:FilesCopied = 0
+    $script:VerifyMismatches = 0
+    $script:AnimPhase = 0
+    $script:BarState = 'running'
+    $barPanel.Invalidate()
+
+    Set-UiEnabled $false
+    Set-StartButtonMode $true
+    $script:RunStart = Get-Date
+    $script:RunProfile = $RunProfile
+    $script:RunDestination = $Destination
+
+    # Timers must start BEFORE the first job: if every job fails to launch, Start-NextJob
+    # reaches Finish-Run synchronously, and Finish-Run must be the last thing to touch them.
+    $script:Timer.Start()
+    $script:AnimTimer.Start()
+    Start-NextJob
 }
 
 function Stop-CurrentProcess {

@@ -208,12 +208,35 @@ $form.Controls.Add($pnlSystemTab)
 
 # --- shared: Start/Cancel button, progress bar, status, log (used by whichever tab is running) ---
 
+$btnActionFont = New-Object System.Drawing.Font('Consolas', 11, [System.Drawing.FontStyle]::Bold)
+
+# Shared action row (y=396). $btnStart alone occupies it for the System tab and while any run
+# (from either tab) is in progress - Cancel always needs the full width. On the Project tab, when
+# idle, $btnFullBackup + $btnSync split it instead; see Update-ActionRow below, which is what
+# actually decides which of these is visible and sizes the split pair (there's no such thing as
+# "anchor to a sibling control" in WinForms, so their geometry can't be handled by Anchor alone).
 $btnStart = New-ThemedButton 'Start Backup' $Theme.AccentRed $Theme.TextPrimary $Theme.AccentRed
 $btnStart.Location = New-Object System.Drawing.Point(12, 396)
 $btnStart.Size = New-Object System.Drawing.Size(670, 40)
-$btnStart.Font = New-Object System.Drawing.Font('Consolas', 11, [System.Drawing.FontStyle]::Bold)
+$btnStart.Font = $btnActionFont
 $btnStart.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
 $form.Controls.Add($btnStart)
+
+# Full Backup: additive only, never deletes anything at the destination - the safe default.
+$btnFullBackup = New-ThemedButton 'Full Backup' $Theme.AccentBlue $Theme.BgMain $Theme.AccentBlue
+$btnFullBackup.Location = New-Object System.Drawing.Point(12, 396)
+$btnFullBackup.Size = New-Object System.Drawing.Size(468, 40)
+$btnFullBackup.Font = $btnActionFont
+$btnFullBackup.Visible = $false
+$form.Controls.Add($btnFullBackup)
+
+# Sync: mirrors project <-> backup in whichever direction you pick, including deletions.
+$btnSync = New-ThemedButton 'Sync' $Theme.AccentRed $Theme.TextPrimary $Theme.AccentRed
+$btnSync.Location = New-Object System.Drawing.Point(494, 396)
+$btnSync.Size = New-Object System.Drawing.Size(188, 40)
+$btnSync.Font = $btnActionFont
+$btnSync.Visible = $false
+$form.Controls.Add($btnSync)
 
 $barPanel = New-Object System.Windows.Forms.Panel
 $barPanel.Location = New-Object System.Drawing.Point(12, 444)
@@ -338,8 +361,6 @@ $pnlLog.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.F
 $form.Controls.Add($pnlLog)
 Set-DarkScrollbars $txtLog
 
-Set-StartButtonMode $false
-
 # --- window icon (taskbar): prefer a real multi-size .ico built from the logo PNG ---
 
 $script:IconPath = Join-Path $PSScriptRoot 'assets\BackStar.ico'
@@ -357,11 +378,39 @@ elseif (Test-Path -LiteralPath $script:LogoPath) {
 Initialize-TrayIcon
 
 # ---------- tab modules ----------
-# Each populates its own panel and defines a Start-<Profile>BackupRun function that the shared
-# Start/Cancel button below dispatches to based on $script:ActiveTab.
+# Each populates its own panel and defines the Start-*Run function(s) the action row below
+# dispatches to. Project defines Start-ProjectFullBackupRun + Start-ProjectSyncRun (its own two
+# split buttons); System defines Start-SystemBackupRun (dispatched from the shared $btnStart).
 
 . (Resolve-BackStarModulePath 'BackStar.UI.ProjectTab.ps1')
 . (Resolve-BackStarModulePath 'BackStar.UI.SystemTab.ps1')
+
+# ---------- action row (Full Backup / Sync split vs. single Start Backup / Cancel) ----------
+# Must come after both tab modules load: $btnFullBackup/$btnSync exist earlier (created above
+# alongside $btnStart), but this also needs $script:ActiveTab, which BackStar.UI.ProjectTab.ps1/
+# BackStar.UI.SystemTab.ps1 don't touch - it's only read here.
+
+function Update-ActionRow {
+    $showSplit = (-not $script:Running) -and ($script:ActiveTab -eq 'Project')
+    $btnStart.Visible = -not $showSplit
+    $btnFullBackup.Visible = $showSplit
+    $btnSync.Visible = $showSplit
+
+    if ($showSplit) {
+        $gap = 12
+        $syncW = 190
+        $fullW = [Math]::Max(100, $btnStart.Width - $syncW - $gap)
+        $btnFullBackup.Location = New-Object System.Drawing.Point($btnStart.Left, $btnStart.Top)
+        $btnFullBackup.Size = New-Object System.Drawing.Size($fullW, $btnStart.Height)
+        $btnSync.Location = New-Object System.Drawing.Point(($btnStart.Left + $fullW + $gap), $btnStart.Top)
+        $btnSync.Size = New-Object System.Drawing.Size($syncW, $btnStart.Height)
+    }
+}
+$form.Add_Resize({ Update-ActionRow })
+
+# Also refreshes the action row (Set-StartButtonMode calls Update-ActionRow internally), now that
+# every control it touches exists.
+Set-StartButtonMode $false
 
 # ---------- tab switching ----------
 
@@ -398,6 +447,8 @@ function Set-ActiveTab([string]$tab) {
         $script:SystemTabSizeScanStarted = $true
         Start-FolderSizeScan
     }
+
+    Update-ActionRow
 }
 
 $btnTabProject.Add_Click({ if (-not $script:Running) { Set-ActiveTab 'Project' } })
@@ -416,8 +467,13 @@ $btnStart.Add_Click({
         Stop-CurrentProcess
         return
     }
-    if ($script:ActiveTab -eq 'Project') { Start-ProjectBackupRun } else { Start-SystemBackupRun }
+    # Idle + visible only happens on the System tab - the Project tab shows $btnFullBackup/
+    # $btnSync instead (see Update-ActionRow).
+    Start-SystemBackupRun
 })
+
+$btnFullBackup.Add_Click({ if (-not $script:Running) { Start-ProjectFullBackupRun } })
+$btnSync.Add_Click({ if (-not $script:Running) { Start-ProjectSyncRun } })
 
 # ---------- shared window events ----------
 

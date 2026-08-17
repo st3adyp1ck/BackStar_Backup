@@ -152,3 +152,75 @@ function Show-ThemedDialog {
     $dlg.Add_Shown({ Set-DarkTitleBar $this })
     return $dlg.ShowDialog($script:form)
 }
+
+# ---------- sync direction picker ----------
+
+function Show-SyncDirectionDialog {
+    # Three-way choice (forward / backward / cancel) reusing DialogResult the same way
+    # Show-ThemedDialog's Yes/No buttons do: setting a button's DialogResult lets WinForms close
+    # the dialog on click with no custom handler needed, sidestepping the closure-capture pitfall
+    # noted above (event handler scriptblocks can't safely capture $dlg either).
+    param(
+        [string]$ForwardLabel,
+        [string]$BackwardLabel
+    )
+    $width = 460
+    $textAreaWidth = $width - 40
+    $flags = [System.Windows.Forms.TextFormatFlags]::WordBreak -bor [System.Windows.Forms.TextFormatFlags]::Left
+    $msg = 'Live Sync makes the destination side an exact mirror of the source side: new and changed files are copied, and anything no longer present on the source side is DELETED from the destination. Choose a direction.'
+    $textSize = [System.Windows.Forms.TextRenderer]::MeasureText($msg, $Theme.FontRegular, (New-Object System.Drawing.Size($textAreaWidth, 0)), $flags)
+    $lblHeight = [Math]::Max(36, $textSize.Height + 8)
+    $btnH = 46
+    $height = 24 + $lblHeight + 16 + $btnH + 12 + $btnH + 20 + 40
+
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'Choose Sync Direction'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+    $dlg.ShowInTaskbar = $false
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.BackColor = $Theme.BgMain
+    $dlg.Font = $Theme.FontRegular
+    $dlg.ClientSize = New-Object System.Drawing.Size($width, $height)
+
+    $bar = New-Object System.Windows.Forms.Panel
+    $bar.Size = New-Object System.Drawing.Size($width, 4)
+    $bar.Location = New-Object System.Drawing.Point(0, 0)
+    $bar.BackColor = $Theme.AccentAmber
+    $dlg.Controls.Add($bar)
+
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = $msg
+    $lbl.ForeColor = $Theme.TextPrimary
+    $lbl.Location = New-Object System.Drawing.Point(20, 20)
+    $lbl.Size = New-Object System.Drawing.Size($textAreaWidth, $lblHeight)
+    $dlg.Controls.Add($lbl)
+
+    $y = 20 + $lblHeight + 16
+
+    $btnForward = New-ThemedButton $ForwardLabel $Theme.BgPanel $Theme.AccentBlue $Theme.AccentBlue
+    $btnForward.Size = New-Object System.Drawing.Size($textAreaWidth, $btnH)
+    $btnForward.Location = New-Object System.Drawing.Point(20, $y)
+    $btnForward.DialogResult = [System.Windows.Forms.DialogResult]::Yes
+    $dlg.Controls.Add($btnForward)
+    $y += $btnH + 12
+
+    $btnBackward = New-ThemedButton $BackwardLabel $Theme.BgPanel $Theme.AccentAmber $Theme.AccentAmber
+    $btnBackward.Size = New-Object System.Drawing.Size($textAreaWidth, $btnH)
+    $btnBackward.Location = New-Object System.Drawing.Point(20, $y)
+    $btnBackward.DialogResult = [System.Windows.Forms.DialogResult]::No
+    $dlg.Controls.Add($btnBackward)
+    $y += $btnH + 20
+
+    $btnCancel = New-ThemedButton 'Cancel' $Theme.BgMain $Theme.TextMuted $Theme.TextMuted
+    $btnCancel.Size = New-Object System.Drawing.Size(90, 30)
+    $btnCancel.Location = New-Object System.Drawing.Point(($width - 110), $y)
+    $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $dlg.Controls.Add($btnCancel)
+
+    $dlg.CancelButton = $btnCancel
+
+    $dlg.Add_Shown({ Set-DarkTitleBar $this })
+    return $dlg.ShowDialog($script:form)
+}
