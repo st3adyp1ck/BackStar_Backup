@@ -1,0 +1,132 @@
+@import "tailwindcss";
+
+/* BackStar design tokens.
+ *
+ * The PowerShell app used Consolas for everything -- body text, labels, and a 16pt
+ * heading -- on near-black with a saturated cyan accent. That combination is the visual
+ * language of a terminal, which is most of why the app read as one. Monospace is kept
+ * here only where character alignment genuinely helps: file paths and log lines.
+ *
+ * Two tokens are new and fix real defects:
+ *   --c-on-accent : text drawn ON an accent fill. The original drew light text on cyan
+ *                   and amber at roughly 1.4:1, which is unreadable.
+ *   --c-ok        : success. The original mapped Success and Header to the same accent,
+ *                   so a completed job looked identical to a section divider.
+ */
+
+@theme {
+  --font-sans: "Inter var", "Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Mono", "Consolas", ui-monospace, monospace;
+
+  --radius-card: 0.75rem;
+}
+
+:root {
+  color-scheme: dark;
+
+  /* Ground. Lifted off pure black and very slightly cool -- a true #0A0A0F ground with a
+   * neon accent is the terminal signature; a lifted ground reads as an application. */
+  --c-bg: #0d0f14;
+  --c-surface: #14171f;
+  --c-surface-2: #1b1f29;
+  --c-border: #262c39;
+  --c-border-strong: #36404f;
+
+  --c-text: #e8edf5;
+  --c-text-dim: #97a3b6;
+  --c-text-faint: #6b7688;
+
+  /* Accent, desaturated from the original #00C8FF so it can carry large fills without
+   * vibrating, while staying recognisably BackStar. */
+  --c-accent: #2ea8e0;
+  --c-accent-hover: #4dbcef;
+  --c-on-accent: #04121a;
+
+  --c-ok: #3fb768;
+  --c-warn: #e0a42e;
+  --c-danger: #e04a5f;
+  --c-on-danger: #fff5f6;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --c-bg: #f7f8fa;
+  --c-surface: #ffffff;
+  --c-surface-2: #f0f2f6;
+  --c-border: #dde1e8;
+  --c-border-strong: #c3cad6;
+
+  --c-text: #131720;
+  --c-text-dim: #566073;
+  --c-text-faint: #7d8799;
+
+  --c-accent: #0b7ab8;
+  --c-accent-hover: #0a6a9f;
+  --c-on-accent: #ffffff;
+
+  --c-ok: #1d7f45;
+  --c-warn: #9a6a06;
+  --c-danger: #bd2438;
+  --c-on-danger: #ffffff;
+}
+
+* {
+  border-color: var(--c-border);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--c-bg);
+  color: var(--c-text);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  /* This is a desktop app shell, not a document. */
+  user-select: none;
+  overflow: hidden;
+}
+
+/* Paths and log lines stay selectable -- the user needs to copy them. */
+.selectable {
+  user-select: text;
+  cursor: text;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--c-border-strong);
+  border-radius: 5px;
+  border: 2px solid var(--c-bg);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--c-text-faint);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* The scanning phase has no denominator, so its bar sweeps rather than fills. */
+@keyframes backstar-indeterminate {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(400%); }
+}

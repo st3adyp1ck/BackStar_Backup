@@ -1,0 +1,9 @@
+# Rust
+/target/
+
+# Node
+/node_modules/
+/dist/
+
+# Tauri generated mobile scaffolding (we are Windows-only for now)
+/src-tauri/gen/

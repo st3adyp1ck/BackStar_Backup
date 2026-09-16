@@ -1,0 +1,49 @@
+[workspace]
+members = ["crates/backstar-core", "src-tauri", "src-restore"]
+resolver = "2"
+
+[workspace.package]
+version = "2.0.0"
+edition = "2021"
+rust-version = "1.82"
+authors = ["st3adyp1ck"]
+license = "MIT"
+
+[workspace.dependencies]
+backstar-core = { path = "crates/backstar-core" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+time = { version = "0.3", features = ["formatting", "parsing", "macros", "serde-well-known", "local-offset"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+blake3 = "1"
+globset = "0.4"
+rayon = "1"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+dunce = "1"
+
+[workspace.dependencies.windows]
+version = "0.58"
+features = [
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
+  "Win32_System_IO",
+  "Win32_System_Registry",
+  "Win32_System_SystemServices",
+  "Win32_System_Com",
+  "Win32_UI_Shell",
+  "Win32_Security",
+]
+
+# Release builds: optimize for a small, fast single binary.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

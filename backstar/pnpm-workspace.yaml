@@ -1,0 +1,5 @@
+allowBuilds:
+  esbuild: true
+# esbuild ships a platform binary via a postinstall script; without this vite cannot run.
+onlyBuiltDependencies:
+  - esbuild

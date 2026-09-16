@@ -1,0 +1,25 @@
+[package]
+name = "backstar-restore"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "BackStar Restore - a standalone, read-only command-line tool for browsing and restoring BackStar snapshots. Ships inside every backup repository; carries no backup capability at all."
+
+[lib]
+name = "backstar_restore_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "BackStar-Restore"
+path = "src/main.rs"
+
+[dependencies]
+# Deliberately not `engine`, `runner`, or anything else that can create or mutate a
+# snapshot -- this tool is read-only by construction, not just by convention. See lib.rs.
+backstar-core.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+time.workspace = true
