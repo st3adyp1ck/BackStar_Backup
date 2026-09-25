@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use backstar_core::config::{Config, Job};
-use backstar_core::events::Event;
+use backstar_core::events::{Event, RunOutcome};
 
 /// The channel name the frontend listens on.
 pub const EVENT_CHANNEL: &str = "backstar://event";
@@ -90,27 +90,72 @@ impl Runner {
         drop(guard);
 
         let slot = self.inner.clone();
+        let thread_label = label.clone();
 
-        let handle = std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("backstar-run".into())
             .spawn(move || {
-                work(&cancel, &mut |ev: Event| sink(ev));
+                // F18: a panic inside `work` must neither kill the process (release
+                // builds used to set panic=abort -- dropped for exactly this) nor wedge
+                // the slot. Catch it, tell the UI the run Failed honestly, and continue
+                // the normal teardown below.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    work(&cancel, &mut |ev: Event| sink(ev));
+                }));
+                if let Err(payload) = result {
+                    let detail = panic_message(payload.as_ref());
+                    tracing::error!("run {thread_label:?} crashed: {detail}");
+                    sink(Event::RunDone {
+                        run_id: String::new(),
+                        outcome: RunOutcome::Failed {
+                            reason: format!(
+                                "internal error: the run crashed unexpectedly ({detail}). \
+                                 Anything already written on disk is unaffected, and the app \
+                                 is still running. This is a bug -- please report it."
+                            ),
+                        },
+                        stats: Default::default(),
+                    });
+                }
 
-                // Clear the slot however the work ended, including on panic-free error
+                // Clear the slot however the work ended, including on error or panic
                 // paths inside `work`. Leaving it set would wedge the app into "already
                 // running" forever.
                 if let Ok(mut g) = slot.lock() {
                     *g = None;
                 }
                 on_finished();
-            })
-            .map_err(|e| format!("could not start the run thread: {e}"))?;
+            });
 
-        // Not joined: the caller returns to the UI immediately. Dropping the handle
-        // detaches the thread, which is what we want.
-        drop(handle);
+        match spawned {
+            Ok(handle) => {
+                // Not joined: the caller returns to the UI immediately. Dropping the
+                // handle detaches the thread, which is what we want.
+                drop(handle);
+                Ok(RunHandle { label, started: true })
+            }
+            Err(e) => {
+                // F48: the slot was claimed above; if the OS thread could not be spawned
+                // at all, release it again or the app is wedged into "already running"
+                // with nothing actually running.
+                if let Ok(mut g) = self.inner.lock() {
+                    *g = None;
+                }
+                Err(format!("could not start the run thread: {e}"))
+            }
+        }
+    }
+}
 
-        Ok(RunHandle { label, started: true })
+/// Render a panic payload for the log/RunDone line: strings where possible, an honest
+/// placeholder otherwise.
+fn panic_message(payload: &dyn std::any::Any) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".into()
     }
 }
 
@@ -161,7 +206,7 @@ mod tests {
         runner.start(
             label,
             move |cancel, emit| {
-                if let Err(e) = engine::run_job(&job, cancel, emit) {
+                if let Err(e) = engine::run_job(&job, None, cancel, emit) {
                     emit(Event::RunDone {
                         run_id: String::new(),
                         outcome: RunOutcome::Failed { reason: e.to_string() },
@@ -330,6 +375,52 @@ mod tests {
         let runner = Runner::default();
         assert!(!runner.cancel());
         assert_eq!(runner.running_label(), None);
+    }
+
+    /// F18: a panic inside the work closure must not kill the process and must not wedge
+    /// the slot -- the UI gets an honest Failed RunDone, and the next run starts fine.
+    /// (With the old `panic = "abort"` release profile, this scenario ended the process
+    /// mid-mirror.)
+    #[test]
+    fn a_panicking_run_reports_failed_and_the_runner_stays_usable() {
+        let runner = Runner::default();
+        let (tx, rx) = mpsc::channel::<Event>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+
+        runner
+            .start(
+                "Doomed".into(),
+                move |_, _| panic!("boom in the work closure"),
+                move |ev| {
+                    let _ = tx.send(ev);
+                },
+                move || {
+                    let _ = done_tx.send(());
+                },
+            )
+            .expect("the run starts; the panic happens on its thread");
+
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("teardown still runs after the panic");
+        assert_eq!(runner.running_label(), None, "the slot must be freed after a panic");
+
+        let events: Vec<Event> = rx.try_iter().collect();
+        let failed = events.iter().any(|e| matches!(
+            e,
+            Event::RunDone { outcome: RunOutcome::Failed { reason }, .. }
+                if reason.contains("internal error")
+        ));
+        assert!(failed, "a panic must surface as a Failed RunDone, got: {events:?}");
+
+        // And the runner is genuinely reusable afterwards.
+        let (done2_tx, done2_rx) = mpsc::channel::<()>();
+        runner
+            .start("Fine".into(), |_, _| {}, |_| {}, move || {
+                let _ = done2_tx.send(());
+            })
+            .expect("a second run must start after a panicked one");
+        done2_rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap();
     }
 
     #[test]

@@ -56,7 +56,9 @@ fn main() {
     let mut progress_events = 0u64;
     let mut last_plan = None;
 
-    let result = engine::run_job(&job, &cancel, &mut |e| match e {
+    // No retention pruning in this bench harness: pass None (production reads
+    // Config.keep_snapshots).
+    let result = engine::run_job(&job, None, &cancel, &mut |e| match e {
         Event::ScanProgress { files_seen, bytes_seen } => {
             scan_reports += 1;
             if scan_reports % 20 == 0 {
@@ -71,6 +73,9 @@ fn main() {
             last_plan = Some((to_copy, to_link));
         }
         Event::FileProgress { .. } => progress_events += 1,
+        Event::VerifyDone { examined, mismatches } => {
+            println!("  verified {examined} file(s), {} mismatch(es)", mismatches.len());
+        }
         Event::FileFailed(err) => println!("  FAILED {}: {}", err.path.display(), err.message),
         _ => {}
     });

@@ -13,6 +13,14 @@
 //!
 //! Both are inverted here: canonicalisation expands short names, and an unresolvable path is
 //! reported as overlapping, so the caller refuses.
+//!
+//! A third defect only bit destinations that did not exist yet: canonicalisation used to
+//! degrade to a purely lexical normalisation when the leaf was missing, so an intermediate
+//! junction (or 8.3 alias, or `\\?\` spelling) anywhere ABOVE the missing leaf made two
+//! spellings of the same place compare as unrelated -- and the guard allowed a backup to be
+//! written into its own source tree. [`canonical_path`] now resolves the longest existing
+//! prefix through the real filesystem and re-appends only the genuinely new tail; a path
+//! with no canonicalisable existing ancestor at all fails closed.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -108,6 +116,10 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 /// escapes the closing quote and fuses every subsequent argument into one. The PowerShell
 /// app defended against this with a `TrimEnd` repeated at thirteen call sites, and two of
 /// those sites were already missing it.
+///
+/// The root special-case must recognise BOTH root spellings: `D:\` and the verbatim
+/// `\\?\D:\` (L3). Stripping either to `D:` / `\\?\D:` yields the drive-RELATIVE form --
+/// "the current directory on D:" -- which is a silently different folder.
 pub fn trim_trailing_sep(path: &Path) -> PathBuf {
     let s = path.as_os_str().to_string_lossy();
     let trimmed = s.trim_end_matches(['\\', '/']);
@@ -116,14 +128,31 @@ pub fn trim_trailing_sep(path: &Path) -> PathBuf {
     if trimmed.is_empty() || (trimmed.len() == 2 && trimmed.ends_with(':')) {
         return PathBuf::from(format!("{trimmed}\\"));
     }
+    // The verbatim spelling of the same root: `\\?\D:` is just as drive-relative.
+    if let Some(rest) = trimmed.strip_prefix(r"\\?\") {
+        if rest.len() == 2 && rest.ends_with(':') {
+            return PathBuf::from(format!(r"\\?\{rest}\"));
+        }
+    }
     PathBuf::from(trimmed)
 }
 
 /// Fully canonicalise a path for comparison: expand env vars, absolutise, resolve `..`,
-/// expand 8.3 short names, then resolve links if the path exists.
+/// expand 8.3 short names, then resolve the LONGEST EXISTING PREFIX through the real
+/// filesystem and re-append the non-existent tail verbatim.
 ///
-/// Errors only when the path is empty or cannot be absolutised. A path that simply does not
-/// exist yet still canonicalises -- backup destinations are routinely created after this check.
+/// The prefix walk is what closes the old fail-open hole: `D:\junction\to\C\newdir` used
+/// to degrade to a purely lexical comparison when `newdir` did not exist yet, so an
+/// intermediate junction, an 8.3 alias, or a `\\?\` verbatim spelling made two spellings
+/// of the same place compare as unrelated -- and the containment guard then allowed a
+/// backup to be written INTO its own source tree. Resolving the deepest ancestor that
+/// DOES exist collapses every spelling of the part that exists, so only the genuinely
+/// new tail is compared verbatim.
+///
+/// Errors when the path is empty, cannot be absolutised, or has no existing ancestor
+/// that canonicalises (an unmounted drive, an unreachable share, a broken junction in
+/// the middle): with nothing trustworthy to compare, the only safe answer is no answer.
+/// Callers (`paths_overlap`) treat that as unsafe and refuse.
 pub fn canonical_path(path: impl AsRef<Path>) -> Result<PathBuf> {
     let raw = path.as_ref();
     if raw.as_os_str().is_empty() {
@@ -143,11 +172,47 @@ pub fn canonical_path(path: impl AsRef<Path>) -> Result<PathBuf> {
     let normalized = lexical_normalize(&absolute);
     let long = expand_short_path(&normalized);
 
-    // `dunce::canonicalize` resolves links and gives back a plain path rather than an
-    // extended-length one, so comparisons against user-supplied paths line up.
-    let resolved = dunce::canonicalize(&long).unwrap_or(long);
-
+    let resolved = resolve_through_existing_prefix(&long)?;
     Ok(trim_trailing_sep(&resolved))
+}
+
+/// Resolve as much of `path` as actually exists through the real filesystem -- junctions,
+/// symlinks and 8.3 aliases included -- then re-append the part that does not exist yet,
+/// verbatim.
+fn resolve_through_existing_prefix(path: &Path) -> Result<PathBuf> {
+    // Components below the deepest existing one, innermost first.
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut cursor = path;
+    loop {
+        // `symlink_metadata`, not `exists()`: a reparse point counts as existing even
+        // when its target is gone, because the point itself still has to be resolved --
+        // treating a broken junction as an opaque name would compare it lexically,
+        // which is exactly the fail-open shape this function exists to close.
+        if std::fs::symlink_metadata(cursor).is_ok() {
+            return match dunce::canonicalize(cursor) {
+                Ok(canon) => {
+                    let mut out = canon;
+                    for comp in tail.iter().rev() {
+                        out.push(comp);
+                    }
+                    Ok(out)
+                }
+                // Something exists here but will not canonicalise (a broken junction,
+                // an unreadable mount point): no truthful comparison is possible.
+                // Fail closed.
+                Err(_) => Err(Error::Unresolvable(cursor.to_path_buf())),
+            };
+        }
+        match (cursor.file_name(), cursor.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name);
+                cursor = parent;
+            }
+            // Reached the root without finding anything that exists -- an unmounted
+            // drive or an unreachable share. No anchor, no guarantee: fail closed.
+            _ => return Err(Error::Unresolvable(path.to_path_buf())),
+        }
+    }
 }
 
 /// True when `outer` is `inner`, or contains it.
@@ -228,6 +293,9 @@ mod tests {
         assert_eq!(trim_trailing_sep(Path::new(r"D:\proj")), PathBuf::from(r"D:\proj"));
         // `D:` alone means "current directory on D:" -- a silently-wrong-folder backup.
         assert_eq!(trim_trailing_sep(Path::new(r"D:\")), PathBuf::from(r"D:\"));
+        // L3: the verbatim root spelling is the same trap -- `\\?\D:` is drive-relative.
+        assert_eq!(trim_trailing_sep(Path::new(r"\\?\D:\")), PathBuf::from(r"\\?\D:\"));
+        assert_eq!(trim_trailing_sep(Path::new(r"\\?\D:\x\")), PathBuf::from(r"\\?\D:\x"));
     }
 
     #[test]
@@ -322,6 +390,125 @@ mod tests {
             "a destination expressed in 8.3 form must still be caught as inside its source"
         );
         assert!(ensure_dest_safe(&short_child, &parent).is_err());
+    }
+
+    /// MT2 (F9), the exact shipped hole: a destination that does not exist YET, sitting
+    /// behind a junction. The guard used to compare it lexically -- `junc\proj\backups`
+    /// shares no prefix with `proj` -- and allowed a backup to be written into its own
+    /// source tree through the junction.
+    #[cfg(windows)]
+    #[test]
+    fn a_nonexistent_destination_behind_a_junction_is_resolved_through_the_junction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("proj");
+        std::fs::create_dir_all(&src).unwrap();
+        let junc = tmp.path().join("junc");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junc)
+            .arg(tmp.path())
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !made {
+            eprintln!("skipping: could not create a junction here");
+            return;
+        }
+
+        // `backups` does not exist; the junction in the middle of the spelling does.
+        let dest = junc.join("proj").join("backups");
+        assert!(!dest.exists());
+
+        assert_eq!(
+            canonical_path(&dest).unwrap(),
+            src.join("backups"),
+            "canonicalisation must resolve the junction even though the leaf is missing"
+        );
+        assert!(
+            paths_overlap(&dest, &src),
+            "the junction-spelled destination is INSIDE the source and must compare so"
+        );
+        assert!(ensure_dest_safe(&dest, &src).is_err());
+    }
+
+    /// MT2 (F9), the 8.3 variant: the intermediate ancestor is expressed as a short name
+    /// and the leaf below it does not exist. `GetLongPathNameW` cannot expand a
+    /// non-existent path, so this only resolves if the EXISTING prefix is resolved first.
+    #[cfg(windows)]
+    #[test]
+    fn a_nonexistent_destination_behind_an_83_alias_is_resolved() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::GetShortPathNameW;
+
+        fn short_path(p: &Path) -> Option<PathBuf> {
+            let wide: Vec<u16> =
+                p.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+            let mut buf = vec![0u16; 32_768];
+            let len =
+                unsafe { GetShortPathNameW(PCWSTR(wide.as_ptr()), Some(buf.as_mut_slice())) };
+            if len == 0 || len as usize >= buf.len() {
+                return None;
+            }
+            buf.truncate(len as usize);
+            Some(PathBuf::from(std::ffi::OsString::from_wide(&buf)))
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("A Very Long Project Folder Name");
+        std::fs::create_dir_all(&src).unwrap();
+        let Some(short_src) = short_path(&src) else {
+            eprintln!("skipping: no 8.3 alias available on this volume");
+            return;
+        };
+        if short_src == src {
+            eprintln!("skipping: volume returned the long name unchanged");
+            return;
+        }
+
+        let dest = short_src.join("brand-new-leaf");
+        assert!(!dest.exists());
+        assert!(
+            paths_overlap(&dest, &src),
+            "an 8.3-spelled destination with a missing leaf must still resolve as inside \
+             its source"
+        );
+        assert!(ensure_dest_safe(&dest, &src).is_err());
+    }
+
+    /// MT2 (F9), the verbatim variant: `\\?\X\...` spellings must compare against plain
+    /// spellings of the same place, missing leaf or not.
+    #[cfg(windows)]
+    #[test]
+    fn a_verbatim_spelling_with_a_missing_leaf_compares_against_the_plain_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("proj");
+        std::fs::create_dir_all(&src).unwrap();
+
+        let dest = PathBuf::from(format!(r"\\?\{}\new-leaf", src.display()));
+        assert!(!dest.exists());
+        assert_eq!(canonical_path(&dest).unwrap(), src.join("new-leaf"));
+        assert!(paths_overlap(&dest, &src));
+        assert!(ensure_dest_safe(&dest, &src).is_err());
+    }
+
+    /// F9, fail-closed direction: a destination on a drive that does not exist at all has
+    /// no existing ancestor to anchor a comparison to, so it must read as UNSAFE, never as
+    /// "unrelated, go ahead".
+    #[test]
+    fn a_destination_with_no_existing_ancestor_fails_closed() {
+        // Find a drive letter that genuinely does not exist on this machine.
+        let missing_drive = (b'A'..=b'Z')
+            .rev()
+            .map(|c| format!(r"{}:\definitely\not\here", c as char))
+            .find(|p| std::fs::symlink_metadata(Path::new(&p[..3])).is_err())
+            .expect("some drive letter must be free");
+
+        assert!(canonical_path(&missing_drive).is_err());
+        assert!(
+            paths_overlap(&missing_drive, r"D:\a"),
+            "an unresolvable destination must compare as overlapping (refuse)"
+        );
     }
 
     #[test]

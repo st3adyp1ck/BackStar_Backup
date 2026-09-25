@@ -1,8 +1,16 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { BrowseEntry, JobStatus, RestoreTarget, SnapshotManifest } from "./types";
+import type {
+  BrowseEntry,
+  JobStatus,
+  OverwriteArg,
+  RestorePlan,
+  RestoreTarget,
+  SnapshotListing,
+} from "./types";
 import { human, outcomeLabel } from "./RunPanel";
+import { relativeTime } from "./App";
 
 function FolderIcon({
   className = "",
@@ -52,17 +60,13 @@ function FileIcon({
   );
 }
 
-function relativeTime(iso: string): string {
-  const then = new Date(iso).getTime();
-  if (Number.isNaN(then)) return iso;
-  const mins = Math.floor((Date.now() - then) / 60000);
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins} min ago`;
-  const hours = Math.floor(mins / 60);
-  if (hours < 24) return `${hours} hour${hours === 1 ? "" : "s"} ago`;
-  const days = Math.floor(hours / 24);
-  if (days < 30) return `${days} day${days === 1 ? "" : "s"} ago`;
-  return new Date(then).toLocaleDateString();
+/** RFC 3339 → a compact local date-time for the overwrite dialog; anything unparseable is shown verbatim. */
+function fmtMtime(iso: string | null): string {
+  if (iso === null) return "date unknown";
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime())
+    ? iso
+    : d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 }
 
 /** The inline panel for restoring one item, opened from a row in the browser. */
@@ -82,9 +86,16 @@ function RestorePanel({
   onStart: (title: string, start: () => Promise<unknown>) => void;
 }) {
   const [original, setOriginal] = useState<string | null | undefined>(undefined);
+  // F60: a failed LOOKUP is not the same as "no original recorded" -- keep the error.
+  const [originalError, setOriginalError] = useState<string | null>(null);
   const [customFolder, setCustomFolder] = useState<string | null>(null);
   const [mode, setMode] = useState<"original" | "custom">("original");
   const [error, setError] = useState<string | null>(null);
+  // F22/D5: overwrite facts computed before anything is written. `null` means either
+  // "not checked yet" or "checked, nothing would be overwritten" -- those are the same
+  // to the user, since a zero-overwrite plan starts the restore without a dialog.
+  const [plan, setPlan] = useState<RestorePlan | null>(null);
+  const [planning, setPlanning] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -99,8 +110,9 @@ function RestorePanel({
           if (p === null) setMode("custom");
         }
       })
-      .catch(() => {
+      .catch((e) => {
         if (!cancelled) {
+          setOriginalError(String(e));
           setOriginal(null);
           setMode("custom");
         }
@@ -131,8 +143,127 @@ function RestorePanel({
         ? { mode: "custom", folder: customFolder }
         : null;
 
-  const destinationPreview =
-    mode === "original" ? original : customFolder ? `${customFolder}\\${name}` : null;
+  function startRestore(t: RestoreTarget, overwrite?: OverwriteArg) {
+    onStart(`Restore: ${name}`, () =>
+      invoke("start_restore", { jobId, snapshotId, snapshotRel: rel, target: t, overwrite }),
+    );
+  }
+
+  /** F22: never write over a destination file without the user seeing the count first. */
+  async function beginRestore() {
+    if (!target) return;
+    setPlanning(true);
+    setError(null);
+    try {
+      const p = await invoke<RestorePlan>("plan_restore_overwrites", {
+        jobId,
+        snapshotId,
+        snapshotRel: rel,
+        target,
+      });
+      if (p.wouldOverwrite === 0) {
+        // Nothing at stake: the default "fail on any overwrite" policy is fine.
+        startRestore(target);
+      } else {
+        setPlan(p);
+      }
+    } catch (e) {
+      // A plan that cannot be computed (an unreadable snapshot subtree) must not degrade
+      // into "just restore anyway" -- an understated confirmation is worse than none.
+      setError(`Could not check what would be overwritten: ${String(e)}`);
+    } finally {
+      setPlanning(false);
+    }
+  }
+
+  if (plan) {
+    const newer = plan.entries.filter((e) => e.destNewer);
+    return (
+      <div
+        className="rounded-[var(--radius-card)] border p-5"
+        style={{
+          background:
+            plan.wouldOverwriteNewer > 0
+              ? "color-mix(in srgb, var(--c-danger) 7%, var(--c-surface))"
+              : "var(--c-surface-2)",
+          borderColor:
+            plan.wouldOverwriteNewer > 0
+              ? "color-mix(in srgb, var(--c-danger) 35%, var(--c-border))"
+              : "var(--c-border-strong)",
+        }}
+      >
+        <h3 className="text-[14px] font-semibold">
+          Restore &ldquo;{name}&rdquo; — confirm overwrite
+        </h3>
+        <p className="mt-1.5 text-[13px]" style={{ color: "var(--c-text-dim)" }}>
+          {plan.wouldOverwrite.toLocaleString()} existing file
+          {plan.wouldOverwrite === 1 ? "" : "s"} at the destination will be overwritten.
+        </p>
+        {plan.wouldOverwriteNewer > 0 && (
+          <>
+            <p className="mt-2 text-[13px] font-medium" style={{ color: "var(--c-danger)" }}>
+              {plan.wouldOverwriteNewer.toLocaleString()} of{" "}
+              {plan.wouldOverwriteNewer === 1 ? "them is" : "them are"} NEWER than the backup
+              — overwriting destroys work that was never backed up:
+            </p>
+            <ul className="mt-2 space-y-2">
+              {newer.slice(0, 10).map((e) => (
+                <li key={e.rel} className="selectable" title={e.dest}>
+                  <span className="block truncate font-mono text-[12px]">{e.dest}</span>
+                  {/* Both dates, so "newer" is something the user can SEE, not trust:
+                      the live file's mtime against the backed-up copy's. */}
+                  <span className="block text-[11.5px]" style={{ color: "var(--c-text-faint)" }}>
+                    yours {fmtMtime(e.destMtime)} · backup {fmtMtime(e.srcMtime)}
+                  </span>
+                </li>
+              ))}
+              {newer.length > 10 && (
+                <li className="text-[12px]" style={{ color: "var(--c-text-faint)" }}>
+                  …and {newer.length - 10} more
+                </li>
+              )}
+            </ul>
+          </>
+        )}
+
+        <div className="mt-4 flex flex-wrap gap-2">
+          {/* Destructive-choice discipline: Cancel is secondary AND default-focused. */}
+          <button
+            onClick={onCancel}
+            autoFocus
+            className="rounded-md px-3.5 py-1.5 text-[13px] font-medium"
+            style={{ background: "var(--c-surface)", color: "var(--c-text)" }}
+          >
+            Cancel
+          </button>
+          {plan.wouldOverwriteNewer > 0 && target && (
+            <button
+              onClick={() => startRestore(target, "ifOlder")}
+              className="rounded-md px-3.5 py-1.5 text-[13px] font-medium"
+              style={{ background: "var(--c-surface)", color: "var(--c-text)" }}
+            >
+              Keep newer files, overwrite the rest
+            </button>
+          )}
+          {target && (
+            <button
+              onClick={() => startRestore(target, "always")}
+              className="rounded-md px-3.5 py-1.5 text-[13px] font-medium"
+              style={
+                plan.wouldOverwriteNewer > 0
+                  ? { background: "var(--c-danger)", color: "var(--c-on-danger)" }
+                  : { background: "var(--c-accent)", color: "var(--c-on-accent)" }
+              }
+            >
+              {plan.wouldOverwriteNewer > 0
+                ? "Overwrite everything"
+                : `Overwrite ${plan.wouldOverwrite.toLocaleString()} file${plan.wouldOverwrite === 1 ? "" : "s"}`}
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div
@@ -145,9 +276,10 @@ function RestorePanel({
         <label className="flex cursor-pointer items-start gap-2.5 text-[13px]">
           <input
             type="radio"
+            name="restore-mode"
             className="mt-0.5"
             checked={mode === "original"}
-            disabled={original === undefined || original === null}
+            disabled={original === undefined || (original === null && originalError === null) || originalError !== null}
             onChange={() => setMode("original")}
           />
           <span>
@@ -155,7 +287,13 @@ function RestorePanel({
             {original === undefined && (
               <span style={{ color: "var(--c-text-faint)" }}> — checking…</span>
             )}
-            {original === null && (
+            {originalError !== null && (
+              <span style={{ color: "var(--c-warn)" }}>
+                {" "}
+                — couldn&rsquo;t check the original location: {originalError}
+              </span>
+            )}
+            {original === null && originalError === null && (
               <span style={{ color: "var(--c-text-faint)" }}>
                 {" "}
                 — not recorded for this item; choose a folder instead
@@ -172,6 +310,7 @@ function RestorePanel({
         <label className="flex cursor-pointer items-start gap-2.5 text-[13px]">
           <input
             type="radio"
+            name="restore-mode"
             className="mt-0.5"
             checked={mode === "custom"}
             onChange={() => setMode("custom")}
@@ -196,15 +335,8 @@ function RestorePanel({
         )}
       </div>
 
-      {destinationPreview && (
-        <p className="mt-3 text-[12px]" style={{ color: "var(--c-text-faint)" }}>
-          Existing files at this location with the same name will be overwritten. Nothing
-          else there is touched or deleted.
-        </p>
-      )}
-
       {error && (
-        <p className="mt-2 text-[12.5px]" style={{ color: "var(--c-danger)" }}>
+        <p className="mt-2 text-[12.5px]" style={{ color: "var(--c-danger)" }} role="alert">
           {error}
         </p>
       )}
@@ -218,17 +350,12 @@ function RestorePanel({
           Cancel
         </button>
         <button
-          disabled={!target}
-          onClick={() => {
-            if (!target) return;
-            onStart(`Restore: ${name}`, () =>
-              invoke("start_restore", { jobId, snapshotId, snapshotRel: rel, target }),
-            );
-          }}
+          disabled={!target || planning}
+          onClick={beginRestore}
           className="rounded-md px-3.5 py-1.5 text-[13px] font-medium disabled:cursor-not-allowed disabled:opacity-40"
           style={{ background: "var(--c-accent)", color: "var(--c-on-accent)" }}
         >
-          Restore
+          {planning ? "Checking…" : "Restore…"}
         </button>
       </div>
     </div>
@@ -243,7 +370,7 @@ export function SnapshotsView({
   onRestoreStarted: (title: string, start: () => Promise<unknown>) => void;
 }) {
   const [jobId, setJobId] = useState<string | null>(jobs[0]?.jobId ?? null);
-  const [snapshots, setSnapshots] = useState<SnapshotManifest[] | null>(null);
+  const [listing, setListing] = useState<SnapshotListing | null>(null);
   const [snapshotId, setSnapshotId] = useState<string | null>(null);
   const [path, setPath] = useState<string[]>([]);
   const [entries, setEntries] = useState<BrowseEntry[] | null>(null);
@@ -252,17 +379,22 @@ export function SnapshotsView({
 
   useEffect(() => {
     if (!jobId) return;
-    setSnapshots(null);
+    setError(null);
+    setListing(null);
     setSnapshotId(null);
     setPath([]);
     setEntries(null);
-    invoke<SnapshotManifest[]>("list_snapshots", { jobId })
-      .then(setSnapshots)
+    invoke<SnapshotListing>("list_snapshots", { jobId })
+      .then((l) => {
+        setListing(l);
+        setError(null);
+      })
       .catch((e) => setError(String(e)));
   }, [jobId]);
 
   useEffect(() => {
     if (!jobId || !snapshotId) return;
+    setError(null);
     setEntries(null);
     setRestoring(null);
     invoke<BrowseEntry[]>("browse_snapshot", {
@@ -270,11 +402,38 @@ export function SnapshotsView({
       snapshotId,
       snapshotRel: path.join("/"),
     })
-      .then(setEntries)
+      .then((e) => {
+        setEntries(e);
+        setError(null);
+      })
       .catch((e) => setError(String(e)));
   }, [jobId, snapshotId, path]);
 
+  // F63: zero jobs is an explicit state, not an eternal "Loading…".
+  if (jobs.length === 0) {
+    return (
+      <div
+        className="mx-auto max-w-[640px] rounded-[var(--radius-card)] border p-6 text-center"
+        style={{ background: "var(--c-surface)", color: "var(--c-text-faint)" }}
+      >
+        No backup jobs yet — create one in Jobs first. Snapshots appear here once a job has
+        run.
+      </div>
+    );
+  }
+
   const activeJob = jobs.find((j) => j.jobId === jobId);
+
+  function selectSnapshot(id: string) {
+    setSnapshotId(id);
+    setPath([]);
+  }
+
+  const snapshotListEmpty =
+    listing != null &&
+    listing.manifests.length === 0 &&
+    listing.unreadable.length === 0 &&
+    listing.incomplete.length === 0;
 
   return (
     <div className="mx-auto grid max-w-[1080px] grid-cols-[280px_1fr] gap-5">
@@ -289,9 +448,11 @@ export function SnapshotsView({
             className="mt-1.5 w-full rounded-md border px-2.5 py-1.5 text-[13px]"
             style={{ background: "var(--c-surface)", borderColor: "var(--c-border)" }}
           >
+            {/* F62: disabled jobs are listed (marked) -- their backups stay reachable. */}
             {jobs.map((j) => (
               <option key={j.jobId} value={j.jobId}>
                 {j.jobName}
+                {!j.enabled ? " (disabled)" : ""}
               </option>
             ))}
           </select>
@@ -301,26 +462,24 @@ export function SnapshotsView({
           className="flex-1 overflow-y-auto rounded-[var(--radius-card)] border"
           style={{ background: "var(--c-surface)", maxHeight: "calc(100vh - 220px)" }}
         >
-          {snapshots === null && (
+          {listing === null && (
             <p className="p-4 text-[12.5px]" style={{ color: "var(--c-text-faint)" }}>
               Loading…
             </p>
           )}
-          {snapshots?.length === 0 && (
+          {snapshotListEmpty && (
             <p className="p-4 text-[12.5px]" style={{ color: "var(--c-text-faint)" }}>
               {activeJob?.jobName ?? "This job"} has no snapshots yet.
             </p>
           )}
-          {snapshots?.map((s) => {
+
+          {listing?.manifests.map((s) => {
             const active = s.id === snapshotId;
             const o = outcomeLabel(s.outcome);
             return (
               <button
                 key={s.id}
-                onClick={() => {
-                  setSnapshotId(s.id);
-                  setPath([]);
-                }}
+                onClick={() => selectSnapshot(s.id)}
                 className="block w-full border-b px-3.5 py-3 text-left last:border-b-0"
                 style={{
                   borderColor: "var(--c-border)",
@@ -339,6 +498,54 @@ export function SnapshotsView({
               </button>
             );
           })}
+
+          {/* F19: a snapshot whose MANIFEST is unreadable is not nothing -- the tree on
+              disk may be fully intact, so it stays browsable, labelled honestly. */}
+          {listing?.unreadable.map(([id, err]) => (
+            <button
+              key={id}
+              onClick={() => selectSnapshot(id)}
+              className="block w-full border-b px-3.5 py-3 text-left last:border-b-0"
+              style={{
+                borderColor: "var(--c-border)",
+                background: id === snapshotId ? "var(--c-surface-2)" : "transparent",
+              }}
+            >
+              <div className="flex items-center justify-between">
+                <span className="selectable font-mono text-[12px]">{id}</span>
+                <span className="text-[11px] font-semibold" style={{ color: "var(--c-warn)" }}>
+                  Damaged record
+                </span>
+              </div>
+              <div className="mt-0.5 text-[11.5px]" style={{ color: "var(--c-text-faint)" }}>
+                The files may be intact; the manifest could not be read: {err}
+              </div>
+            </button>
+          ))}
+
+          {/* Manifest-less dirs are an interrupted run's leftovers (pruned by the next
+              run). Browsable as plain folders, but never presented as finished backups. */}
+          {listing?.incomplete.map((id) => (
+            <button
+              key={id}
+              onClick={() => selectSnapshot(id)}
+              className="block w-full border-b px-3.5 py-3 text-left last:border-b-0"
+              style={{
+                borderColor: "var(--c-border)",
+                background: id === snapshotId ? "var(--c-surface-2)" : "transparent",
+              }}
+            >
+              <div className="flex items-center justify-between">
+                <span className="selectable font-mono text-[12px]">{id}</span>
+                <span className="text-[11px] font-semibold" style={{ color: "var(--c-warn)" }}>
+                  Incomplete
+                </span>
+              </div>
+              <div className="mt-0.5 text-[11.5px]" style={{ color: "var(--c-text-faint)" }}>
+                Leftover from a run that did not finish; the next run cleans it up.
+              </div>
+            </button>
+          ))}
         </div>
       </aside>
 
@@ -347,7 +554,7 @@ export function SnapshotsView({
         style={{ background: "var(--c-surface)" }}
       >
         {error && (
-          <p className="mb-3 text-[13px]" style={{ color: "var(--c-danger)" }}>
+          <p className="mb-3 text-[13px]" style={{ color: "var(--c-danger)" }} role="alert">
             {error}
           </p>
         )}
@@ -384,7 +591,7 @@ export function SnapshotsView({
               ))}
             </nav>
 
-            {entries === null && (
+            {entries === null && !error && (
               <p className="text-[12.5px]" style={{ color: "var(--c-text-faint)" }}>
                 Loading…
               </p>

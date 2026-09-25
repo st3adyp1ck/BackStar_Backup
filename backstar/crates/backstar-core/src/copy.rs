@@ -13,13 +13,39 @@
 //! in place and therefore cannot be used to populate a snapshot that hardlinks to its
 //! predecessor without corrupting history. Renaming replaces the directory entry instead,
 //! leaving the old inode intact and still referenced by the older snapshot.
+//!
+//! The temp name is deliberately short and capped (`.bstmp-<pid>-<counter>-<first 24 chars
+//! of the real name>`): the old scheme prepended ~21 characters to the FULL name, which
+//! pushed a legal >234-character source name past the 255-character component limit and
+//! failed every copy of such a file (F38). All filesystem touchpoints here go through
+//! [`extended_path`], so a file whose full path exceeds 260 chars copies even where the OS
+//! is not configured long-path-aware. Crash-orphaned temp files (both the current prefix
+//! and the legacy `.backstar-tmp-` one) are never enumerated into any plan by the walker;
+//! they are removed by the mirror's destination sweep (F39, [`remove_file_clearing_readonly`]) or by the
+//! snapshot side's wholesale prune of manifest-less dirs (F35, `engine.rs`).
 
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::guards::extended_path;
 use crate::{Error, Result};
+
+/// Hash a file's contents with blake3, streamed (never whole-file into memory), returning
+/// the hex digest.
+///
+/// This is the D1 verification primitive: CopyFileExW does the actual copying in the
+/// kernel, so "hash-on-copy" means hashing the source immediately after the copy
+/// completes (one extra read per changed file) and re-hashing the destination in the
+/// post-run verify pass. Linked files are never hashed -- a hardlink is the same inode
+/// whose content was verified by the run that first copied it.
+pub(crate) fn blake3_hex(path: &Path) -> Result<String> {
+    let f = std::fs::File::open(extended_path(path)).map_err(|e| Error::io(path, e))?;
+    let mut reader = std::io::BufReader::with_capacity(1024 * 1024, f);
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut reader, &mut hasher).map_err(|e| Error::io(path, e))?;
+    Ok(hasher.finalize().to_hex().to_string())
+}
 
 /// Outcome of copying one file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,15 +102,60 @@ unsafe extern "system" fn progress_thunk(
     result.unwrap_or(win::PROGRESS_CANCEL)
 }
 
+/// The marker prefix on every temp file BackStar writes next to an in-progress copy
+/// destination, and the pre-A1c form, which crash-orphaned leftovers on real disks can
+/// still carry. The walker never enumerates either into a plan, and
+/// [`sweep_orphaned_temps`] removes both.
+pub(crate) const TEMP_PREFIX: &str = ".bstmp-";
+pub(crate) const LEGACY_TEMP_PREFIX: &str = ".backstar-tmp-";
+
+/// True for BackStar's own in-progress copy temp names, current and legacy. These are
+/// engine artifacts, never content: no snapshot, mirror plan, or restore may include them.
+pub(crate) fn is_temp_file_name(name: &str) -> bool {
+    name.starts_with(TEMP_PREFIX) || name.starts_with(LEGACY_TEMP_PREFIX)
+}
+
 /// A temporary sibling name for an in-progress copy.
 ///
 /// Placed next to the destination so the final rename stays on one volume, and prefixed so
 /// an interrupted run leaves something recognisably ours to clean up.
+///
+/// The shape is `.bstmp-<pid>-<counter>-<first 24 chars of the real name>`. The pid plus a
+/// process-wide counter keep concurrent copiers off the same name; the embedded fragment of
+/// the real name exists only so a human can recognise a leftover, and it is CAPPED because
+/// the destination's own name may nearly fill the 255-character component limit -- the old
+/// scheme prepended `.backstar-tmp-<pid>-` (~21 chars) to the FULL name, so a legal
+/// 240-char source file produced a 261-char temp name and failed every copy (F38).
 fn temp_sibling(dest: &Path) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let name = dest.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    // The process id keeps two concurrent runs from colliding on the same temp name.
-    let unique = std::process::id();
-    dest.with_file_name(format!(".backstar-tmp-{unique}-{name}"))
+    let base: String = name.chars().take(24).collect();
+    dest.with_file_name(format!("{}{}-{}-{base}", TEMP_PREFIX, std::process::id(), n))
+}
+
+/// Remove a file, clearing a read-only attribute first if one blocks removal. Copy
+/// destinations inherit read-only from their sources (`CopyFileExW` copies attributes),
+/// so both the temp-orphan sweep (F39) and the verify pass's removal of a bad copy (D1)
+/// must not be stopped by the bit. Current Windows deletes read-only files outright; the
+/// clearing is for filesystems and downlevel semantics that still refuse -- harmless
+/// where unneeded.
+pub(crate) fn remove_file_clearing_readonly(path: &Path) -> std::io::Result<()> {
+    let path = extended_path(path);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(first) => {
+            let Ok(md) = std::fs::symlink_metadata(&path) else { return Err(first) };
+            if !md.permissions().readonly() {
+                return Err(first);
+            }
+            let mut perms = md.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(&path, perms);
+            std::fs::remove_file(&path)
+        }
+    }
 }
 
 /// Copy `src` to `dest`, reporting `(bytes_done, bytes_total)` as it goes.
@@ -108,10 +179,10 @@ pub fn copy_file(
     }
 
     if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+        std::fs::create_dir_all(extended_path(parent)).map_err(|e| Error::io(parent, e))?;
     }
 
-    let size = std::fs::symlink_metadata(src).map_err(|e| Error::io(src, e))?.len();
+    let size = std::fs::symlink_metadata(extended_path(src)).map_err(|e| Error::io(src, e))?.len();
     let tmp = temp_sibling(dest);
 
     let src_w: Vec<u16> = extended_path(src)
@@ -146,7 +217,7 @@ pub fn copy_file(
     if let Err(e) = result {
         // A cancel surfaces here as ERROR_REQUEST_ABORTED; the kernel already removed the
         // partial temp file, but sweep anyway in case it did not.
-        let _ = std::fs::remove_file(&tmp);
+        let _ = remove_file_clearing_readonly(&tmp);
         if cancel.load(Ordering::Relaxed) {
             return Ok(CopyOutcome::Cancelled);
         }
@@ -159,19 +230,18 @@ pub fn copy_file(
 
     // Replace the directory entry. A read-only destination blocks the rename, so clear the
     // attribute first -- backup destinations routinely inherit read-only from the source.
-    if dest.exists() {
-        if let Ok(md) = std::fs::metadata(dest) {
-            let mut perms = md.permissions();
-            if perms.readonly() {
-                #[allow(clippy::permissions_set_readonly_false)]
-                perms.set_readonly(false);
-                let _ = std::fs::set_permissions(dest, perms);
-            }
+    let dest_x = extended_path(dest);
+    if let Ok(md) = std::fs::symlink_metadata(&dest_x) {
+        let mut perms = md.permissions();
+        if perms.readonly() {
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(&dest_x, perms);
         }
     }
 
-    std::fs::rename(&tmp, dest).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
+    std::fs::rename(extended_path(&tmp), &dest_x).map_err(|e| {
+        let _ = remove_file_clearing_readonly(&tmp);
         Error::io(dest, e)
     })?;
 
@@ -204,17 +274,19 @@ pub fn copy_file(
 #[cfg(windows)]
 pub fn hard_link(existing: &Path, link: &Path) -> Result<()> {
     if let Some(parent) = link.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+        std::fs::create_dir_all(extended_path(parent)).map_err(|e| Error::io(parent, e))?;
     }
-    std::fs::hard_link(existing, link).map_err(|e| Error::io(link, e))
+    std::fs::hard_link(extended_path(existing), extended_path(link))
+        .map_err(|e| Error::io(link, e))
 }
 
 #[cfg(not(windows))]
 pub fn hard_link(existing: &Path, link: &Path) -> Result<()> {
     if let Some(parent) = link.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+        std::fs::create_dir_all(extended_path(parent)).map_err(|e| Error::io(parent, e))?;
     }
-    std::fs::hard_link(existing, link).map_err(|e| Error::io(link, e))
+    std::fs::hard_link(extended_path(existing), extended_path(link))
+        .map_err(|e| Error::io(link, e))
 }
 
 #[cfg(test)]
@@ -268,7 +340,7 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n.starts_with(".backstar-tmp-"))
+            .filter(|n| is_temp_file_name(n))
             .collect();
         assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
     }
@@ -366,7 +438,7 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n.starts_with(".backstar-tmp-"))
+            .filter(|n| is_temp_file_name(n))
             .collect();
         assert!(leftovers.is_empty(), "no temp files left: {leftovers:?}");
     }
@@ -428,5 +500,94 @@ mod tests {
             |_, _| {},
         );
         assert!(out.is_err());
+    }
+
+    /// D1's primitive: hashes are real blake3 digests of the file content (known vector
+    /// for the empty input), stable, and content-sensitive.
+    #[test]
+    fn blake3_hex_hashes_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = tmp.path().join("empty.bin");
+        write(&empty, "");
+        assert_eq!(
+            blake3_hex(&empty).unwrap(),
+            "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+            "blake3 of the empty string is a fixed public vector"
+        );
+
+        let f = tmp.path().join("f.bin");
+        write(&f, "content one");
+        let h1 = blake3_hex(&f).unwrap();
+        assert_eq!(h1.len(), 64, "hex digest is 32 bytes");
+        write(&f, "content two");
+        assert_ne!(blake3_hex(&f).unwrap(), h1, "content changes the digest");
+    }
+
+    /// F38, at the naming level: the temp sibling of a destination whose own name nearly
+    /// fills the 255-character component limit must still fit it -- the old
+    /// `.backstar-tmp-{pid}-{full-name}` scheme produced a >255-char name for any legal
+    /// source name over ~234 chars, failing every copy of such a file.
+    #[test]
+    fn temp_names_stay_under_the_component_limit_for_long_destination_names() {
+        let long_name = format!("{}.txt", "n".repeat(240));
+        let tmp = temp_sibling(Path::new(r"D:\dest").join(&long_name).as_path());
+        let name = tmp.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with(TEMP_PREFIX), "recognisably ours: {name}");
+        assert!(
+            name.len() <= 64,
+            "the temp name must be capped no matter how long the real name is: {name}"
+        );
+        // And two calls for the same destination never collide.
+        let other = temp_sibling(Path::new(r"D:\dest").join(&long_name).as_path());
+        assert_ne!(tmp, other, "the counter keeps sequential copies on distinct names");
+    }
+
+    /// F38, end to end: a file named at the NTFS component limit must copy successfully.
+    /// The full path here exceeds 260 chars, so this also exercises the extended-length
+    /// plumbing on machines that are not configured long-path-aware. Setup and
+    /// verification go through `extended_path` explicitly for the same reason.
+    #[test]
+    fn a_240_char_filename_copies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let name = format!("{}.txt", "n".repeat(236)); // exactly 240 chars
+        let src = tmp.path().join(&name);
+        std::fs::write(extended_path(&src), "long name content").unwrap();
+
+        let dest = tmp.path().join("out").join(&name);
+        let out = copy_file(&src, &dest, &AtomicBool::new(false), |_, _| {}).unwrap();
+
+        assert!(matches!(out, CopyOutcome::Copied { .. }), "got: {out:?}");
+        assert_eq!(
+            std::fs::read_to_string(extended_path(&dest)).unwrap(),
+            "long name content"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(extended_path(dest.parent().unwrap()))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| is_temp_file_name(n))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+    }
+
+    /// F39: removing a temp orphan must not be blocked by a read-only attribute --
+    /// CopyFileExW copies the source's attributes onto the temp, so a crashed copy of a
+    /// read-only file leaves a read-only orphan. (On current Windows a plain DeleteFile
+    /// already removes read-only files; the attribute clearing matters for filesystems
+    /// and downlevel semantics where it does not, and is harmless where it does not.)
+    #[test]
+    fn a_read_only_temp_orphan_is_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orphan = tmp.path().join(".backstar-tmp-99-deadfile.txt");
+        write(&orphan, "junk");
+        let mut perms = std::fs::metadata(&orphan).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&orphan, perms).unwrap();
+
+        remove_file_clearing_readonly(&orphan).unwrap();
+        assert!(!orphan.exists(), "the orphan is gone");
+
+        // A missing file reports the original error, not a confusing secondary one.
+        assert!(remove_file_clearing_readonly(&orphan).is_err());
     }
 }

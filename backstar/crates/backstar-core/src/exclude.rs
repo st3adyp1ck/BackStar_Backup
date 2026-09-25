@@ -7,7 +7,9 @@
 //! * **dir paths** -- source-relative paths, because the leaf name alone is too common to
 //!   ban globally. Capacitor regenerates `apps/mobile/ios/App/App/public` on every
 //!   `npx cap sync`, and it is named `public` like a real asset folder.
-//! * **file patterns** -- globs against the file name (`Thumbs.db`, `*.tmp`).
+//! * **file patterns** -- globs against the file name (`Thumbs.db`, `*.tmp`), matched
+//!   case-insensitively: robocopy's `/XF` is case-insensitive, NTFS is case-insensitive,
+//!   and a user who excludes `*.tmp` means `FILE.TMP` too.
 //!
 //! Two rules here exist because of shipped bugs. Both have regression tests below.
 //!
@@ -27,7 +29,7 @@
 
 use std::path::Path;
 
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 
 /// Directory names excluded from project backups, at any depth.
@@ -77,7 +79,7 @@ pub struct ExcludeRules {
     pub dir_names: Vec<String>,
     /// Source-relative directory paths.
     pub dir_paths: Vec<String>,
-    /// File-name globs.
+    /// File-name globs, matched case-insensitively against the file name.
     pub file_patterns: Vec<String>,
 }
 
@@ -109,8 +111,9 @@ impl ExcludeRules {
         let mut files = GlobSetBuilder::new();
         for p in &self.file_patterns {
             // A plain name like `Thumbs.db` is a valid glob matching itself, so both
-            // literal names and wildcards go through the same path.
-            if let Ok(g) = Glob::new(p) {
+            // literal names and wildcards go through the same path. Case-insensitive
+            // like robocopy's /XF: excluding `*.tmp` must also catch `FILE.TMP`.
+            if let Ok(g) = GlobBuilder::new(p).case_insensitive(true).build() {
                 files.add(g);
             }
         }
@@ -130,7 +133,13 @@ impl ExcludeRules {
     }
 }
 
-fn normalize_for_compare(p: &Path) -> String {
+/// Normalise a path for comparison: lowercase, backslash-separated, no trailing separator.
+///
+/// Crate-visible because the mirror's delete-set construction (F4) must compare relative
+/// paths with the exact same case rules NTFS applies -- a case-only rename (`README.txt`
+/// vs `readme.txt`) must compare equal, or a delete gets planned for a file whose recopy
+/// was never queued.
+pub(crate) fn normalize_for_compare(p: &Path) -> String {
     p.to_string_lossy().trim_end_matches(['\\', '/']).to_lowercase().replace('/', "\\")
 }
 
@@ -158,7 +167,8 @@ impl CompiledExcludes {
         self.abs_dir_paths.contains(&lpath)
     }
 
-    /// Should this file be skipped? Matched against the file name only, not the full path.
+    /// Should this file be skipped? Matched against the file name only, not the full path,
+    /// and case-insensitively -- see [`ExcludeRules::file_patterns`].
     pub fn is_file_excluded(&self, name: &str) -> bool {
         if self.file_globs.is_empty() {
             return false;
@@ -248,6 +258,30 @@ mod tests {
         assert!(!e.is_file_excluded("notes.txt"));
         // `*.tmp` must not match a file that merely contains the text.
         assert!(!e.is_file_excluded("tmp.txt"));
+    }
+
+    /// Regression test for F32: robocopy's `/XF` is case-insensitive and so is NTFS, so a
+    /// glob written `Thumbs.db` must catch `THUMBS.DB` -- a case-sensitive glob silently
+    /// let every uppercase variant through.
+    #[test]
+    fn file_globs_are_case_insensitive() {
+        let e = sys();
+        assert!(e.is_file_excluded("THUMBS.DB"));
+        assert!(e.is_file_excluded("DESKTOP.INI"));
+        assert!(e.is_file_excluded("FILE.TMP"));
+        assert!(e.is_file_excluded("Anything.TmP"));
+        assert!(!e.is_file_excluded("keep.txt"));
+
+        // Custom patterns go through the same path.
+        let rules = ExcludeRules {
+            dir_names: vec![],
+            dir_paths: vec![],
+            file_patterns: vec!["*.bak".into(), "secret.key".into()],
+        };
+        let e = rules.compile(Path::new(r"C:\a"), Path::new(r"D:\b"));
+        assert!(e.is_file_excluded("BACKUP.BAK"));
+        assert!(e.is_file_excluded("SECRET.KEY"));
+        assert!(!e.is_file_excluded("public.key.txt"));
     }
 
     #[test]

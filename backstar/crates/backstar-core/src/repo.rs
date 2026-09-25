@@ -4,6 +4,7 @@
 //! <dest>/
 //!   .backstar/
 //!     repo.json                    repo identity and schema
+//!     run.lock                     cross-process run exclusion, held only during a run
 //!     snapshots/<id>.json          one manifest per snapshot
 //!   snapshots/<id>/<source>/...    the files themselves, as a plain tree
 //!   RESTORE-README.txt             how to recover with no software at all
@@ -74,6 +75,22 @@ pub struct SnapshotManifest {
     pub outcome: RunOutcome,
     /// The snapshot this one linked unchanged files against, if any.
     pub parent: Option<String>,
+    /// Configured sources (folder paths or preset keys) that were skipped because they no
+    /// longer existed at run time. Recorded so "the job backed up everything it was asked
+    /// to" is checkable from the manifest alone, not just from the live event stream.
+    /// `#[serde(default)]` keeps manifests written before this field existed readable --
+    /// additive, not a schema break.
+    #[serde(default)]
+    pub skipped_sources: Vec<String>,
+    /// blake3 hex digests of the files COPIED in this run (D1), keyed by
+    /// `<source-name>/<relative-path>` with `/` separators regardless of platform. Linked
+    /// files carry no hash: a hardlink is the same inode whose content was verified by the
+    /// run that first copied it, so the verification travels with the data -- and hashing
+    /// only churn keeps the manifest proportional to what changed, not to the tree's size.
+    /// Files that FAILED verification are absent (they were removed from the snapshot).
+    /// `#[serde(default)]` keeps pre-D1 manifests readable.
+    #[serde(default)]
+    pub copied_hashes: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +113,29 @@ pub struct SnapshotEntry {
     /// `None` for directories, matching how [`crate::presets::Preset`] and [`crate::config::Job`]
     /// use `None` elsewhere for "not applicable" rather than an invented `0`.
     pub size: Option<u64>,
+}
+
+/// The full truth about what is on disk in a repository, for consumers that must not
+/// hide damage (F19): the installed app's snapshot browser and the restore CLI both list
+/// from this.
+///
+/// Every snapshot DIRECTORY on disk appears in exactly one of the three lists, because a
+/// directory is the actual backup and must never vanish from view the way a failed
+/// manifest parse used to make it vanish from `manifests()`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotListing {
+    /// Snapshots whose manifest read and parsed cleanly, oldest first.
+    pub manifests: Vec<SnapshotManifest>,
+    /// Snapshots whose manifest exists but could not be read or parsed: `(id, error)`.
+    /// The tree may be entirely intact -- only the bookkeeping is damaged -- so these
+    /// are listed, with the error, rather than silently dropped.
+    pub unreadable: Vec<(String, String)>,
+    /// Snapshot directories with NO manifest at all: the remains of runs that died
+    /// before finishing (the manifest is written last), which the next run prunes (F35).
+    /// Browsable as plain folders -- they ARE plain folders -- but must be presented as
+    /// incomplete, never as a finished backup.
+    pub incomplete: Vec<String>,
 }
 
 /// A backup repository rooted at a destination folder.
@@ -122,7 +162,11 @@ pub fn snapshot_id_from(ts: OffsetDateTime) -> String {
     )
 }
 
-fn rfc3339(ts: OffsetDateTime) -> String {
+/// THE RFC-3339 formatting helper for the whole crate (L2): one function, one fallback
+/// policy. An unformattable timestamp (far out of `time`'s range -- never a real clock)
+/// degrades to the epoch rather than an empty string, so a manifest or banner never
+/// carries a blank that reads as "no time recorded".
+pub(crate) fn rfc3339(ts: OffsetDateTime) -> String {
     ts.format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| String::from("1970-01-01T00:00:00Z"))
 }
@@ -184,6 +228,24 @@ impl Repo {
 
     pub fn snapshot_dir(&self, id: &str) -> PathBuf {
         self.snapshots_root().join(id)
+    }
+
+    /// Take the cross-process run lock for this repository: `.backstar/run.lock`, held
+    /// open exclusively for the guard's lifetime (see [`crate::runlock`] for the
+    /// mechanism and the crash-staleness story). One run per repository at a time, no
+    /// matter which binary is driving -- the installed app and the headless scheduler
+    /// are different processes and share no in-process lock.
+    ///
+    /// [`crate::engine::run_job`] acquires this for the whole run. The guard is
+    /// deliberately not re-entrant: a second acquire -- even in the same process, even
+    /// on the same thread -- fails with [`Error::RunInProgress`]. Restores through the
+    /// portable tool never take it; that tool opens repositories read-only and must not
+    /// create files in them.
+    pub fn acquire_run_lock(&self) -> Result<crate::runlock::RunLock> {
+        crate::runlock::RunLock::acquire(
+            self.root.join(META_DIR).join(crate::runlock::REPO_RUN_LOCK_NAME),
+            &self.root,
+        )
     }
 
     /// List the immediate children of a path inside a snapshot. An empty `snapshot_rel`
@@ -254,7 +316,9 @@ impl Repo {
         self.snapshot_ids().pop()
     }
 
-    /// Reserve an unused snapshot id for a run starting at `ts`.
+    /// Reserve an unused snapshot id for a run starting at `ts`, ATOMICALLY: the
+    /// snapshot directory is created as the reservation, and this function returns only
+    /// for an id whose directory create succeeded. Callers must not create it again.
     ///
     /// Ids are second-resolution so they stay readable in Explorer, which means two runs
     /// started within the same second collide. Reusing a colliding id is not a cosmetic
@@ -262,23 +326,82 @@ impl Repo {
     /// points in time into one and making edited files appear inside a snapshot taken
     /// before the edit. A disambiguating suffix is appended instead.
     ///
+    /// The reservation is `create_dir`, and `AlreadyExists` is the compare-and-swap that
+    /// moves to the next suffix. The old check-then-create version (`exists()`, then the
+    /// caller created the directory) let two racing handles -- the run lock serialises
+    /// *runs*, not every caller of this function -- both observe "free" and both take
+    /// the same id (F3).
+    ///
     /// The suffix is zero-padded so that string ordering stays chronological -- `-002`
     /// before `-010`, which a bare counter would get backwards.
+    ///
+    /// One more rule, which retention pruning (D2) makes load-bearing: never take an id
+    /// that would sort BEFORE an existing same-second id. Pruning frees old ids, and the
+    /// unsuffixed base sorts before its own suffixes (`…Z` < `…Z-002`) -- so with the
+    /// base pruned and suffixes surviving, retaking the base would order the NEWEST run
+    /// before older ones, and the next retention pass would then prune the run's own
+    /// fresh snapshot as "oldest". The allocator therefore takes the first candidate
+    /// that sorts after every existing same-second id.
     pub fn allocate_snapshot_id(&self, ts: OffsetDateTime) -> Result<String> {
+        // Defensive: `open_or_init` already made this directory, but the reservation must
+        // not silently depend on that (a repo opened read-only-ish by `open` is a
+        // legitimate caller's handle too).
+        let snapshots = self.snapshots_root();
+        std::fs::create_dir_all(&snapshots).map_err(|e| Error::io(&snapshots, e))?;
+
         let base = snapshot_id_from(ts);
-        if !self.snapshot_dir(&base).exists() {
-            return Ok(base);
-        }
-        for n in 2..1000u32 {
-            let candidate = format!("{base}-{n:03}");
-            if !self.snapshot_dir(&candidate).exists() {
-                return Ok(candidate);
+        // Which ids for this second already exist: the base itself, and the highest
+        // numeric suffix. Recomputed after every collision (another allocator may have
+        // raced us).
+        let scan = |base: &str| -> (bool, u32) {
+            let mut base_taken = false;
+            let mut max_suffix = 0u32;
+            if let Ok(rd) = std::fs::read_dir(&snapshots) {
+                for e in rd.filter_map(|e| e.ok()) {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if name == base {
+                        base_taken = true;
+                    } else if let Some(rest) = name.strip_prefix(&format!("{base}-")) {
+                        if let Ok(n) = rest.parse::<u32>() {
+                            max_suffix = max_suffix.max(n);
+                        }
+                    }
+                }
+            }
+            (base_taken, max_suffix)
+        };
+
+        let (mut base_taken, mut max_suffix) = scan(&base);
+        for _ in 0..1000u32 {
+            // The unsuffixed id only when nothing for this second exists at all; then
+            // `-002`, `-003`, ... -- zero-padded, and always sorting after everything
+            // currently present for this second.
+            let candidate = if !base_taken && max_suffix == 0 {
+                base.clone()
+            } else {
+                format!("{base}-{:03}", (max_suffix + 1).max(2))
+            };
+            match std::fs::create_dir(self.snapshot_dir(&candidate)) {
+                Ok(()) => return Ok(candidate),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Lost a race (or the scan went stale): rescan and try again.
+                    (base_taken, max_suffix) = scan(&base);
+                }
+                Err(e) => return Err(Error::io(self.snapshot_dir(&candidate), e)),
             }
         }
         Err(Error::other(format!(
             "could not allocate a snapshot id for {base}: 999 snapshots already exist for \
              that second"
         )))
+    }
+
+    /// Whether a manifest exists on disk for `id`. The incomplete-snapshot prune (F35)
+    /// and the listing API (F19) both key off this: a snapshot directory without a
+    /// manifest is a run that died before finishing, because the manifest is written
+    /// last.
+    pub(crate) fn has_manifest(&self, id: &str) -> bool {
+        self.manifest_path(id).is_file()
     }
 
     pub fn read_manifest(&self, id: &str) -> Result<SnapshotManifest> {
@@ -291,8 +414,29 @@ impl Repo {
         write_atomic(&self.manifest_path(&m.id), serde_json::to_string_pretty(m)?.as_bytes())
     }
 
+    /// List every snapshot on disk, sorted into the three honesty buckets (F19).
+    /// This is what listing consumers should call; [`Self::manifests`] is the
+    /// "readable manifests only" projection of it.
+    pub fn list_snapshots_full(&self) -> SnapshotListing {
+        let mut out = SnapshotListing::default();
+        for id in self.snapshot_ids() {
+            if !self.has_manifest(&id) {
+                out.incomplete.push(id);
+                continue;
+            }
+            match self.read_manifest(&id) {
+                Ok(m) => out.manifests.push(m),
+                Err(e) => out.unreadable.push((id, e.to_string())),
+            }
+        }
+        out
+    }
+
+    /// The readable manifests of every snapshot, oldest first. Damage is surfaced, not
+    /// hidden, by [`Self::list_snapshots_full`]; this projection exists for callers that
+    /// genuinely only operate on intact snapshots.
     pub fn manifests(&self) -> Vec<SnapshotManifest> {
-        self.snapshot_ids().iter().filter_map(|id| self.read_manifest(id).ok()).collect()
+        self.list_snapshots_full().manifests
     }
 
     /// Remove a snapshot and its manifest.
@@ -311,15 +455,53 @@ impl Repo {
         Ok(())
     }
 
-    /// Which snapshots to delete to honour a keep-last-N policy, oldest first.
+    /// Which of THIS JOB's snapshots to delete to honour a keep-last-N policy, oldest
+    /// first (D2). Per-job, deliberately: two jobs sharing one destination must never
+    /// prune each other's history -- the old repo-wide query could not even see that
+    /// distinction.
+    ///
+    /// Only snapshots with a readable manifest naming this job are considered: a snapshot
+    /// whose manifest is damaged is never deleted on a policy's say-so (it may belong to
+    /// any job), and manifest-less dirs are the startup prune's business (F35), not
+    /// retention's.
     ///
     /// Returns ids rather than deleting, so the caller can show the user what will go.
-    pub fn snapshots_to_prune(&self, keep: u32) -> Vec<String> {
-        let ids = self.snapshot_ids();
-        if keep == 0 || ids.len() <= keep as usize {
+    /// `keep = 0` keeps everything -- getting that backwards would destroy every backup.
+    pub fn snapshots_to_prune_for_job(&self, job_name: &str, keep: u32) -> Vec<String> {
+        if keep == 0 {
+            return Vec::new();
+        }
+        // The listing reads dirs oldest-first; manifests preserve that order.
+        let ids: Vec<String> = self
+            .list_snapshots_full()
+            .manifests
+            .into_iter()
+            .filter(|m| m.job == job_name)
+            .map(|m| m.id)
+            .collect();
+        if ids.len() <= keep as usize {
             return Vec::new();
         }
         ids[..ids.len() - keep as usize].to_vec()
+    }
+
+    /// Delete this job's oldest snapshots beyond keep-last-N, returning how many were
+    /// actually deleted. Per-id failures are logged and skipped: a locked file must not
+    /// fail the run that just succeeded. Space-safe: deleting a snapshot dir drops
+    /// NAMES -- file data shared with surviving snapshots via hardlinks is
+    /// reference-counted by the filesystem (see [`Self::delete_snapshot`]).
+    pub fn prune_job_snapshots(&self, job_name: &str, keep: u32) -> u64 {
+        let mut pruned = 0;
+        for id in self.snapshots_to_prune_for_job(job_name, keep) {
+            match self.delete_snapshot(&id) {
+                Ok(()) => {
+                    pruned += 1;
+                    tracing::info!("pruned snapshot {id} (keep newest {keep} for job {job_name:?})");
+                }
+                Err(e) => tracing::warn!("could not prune snapshot {id}: {e}"),
+            }
+        }
+        pruned
     }
 
     /// Write the plain-text recovery instructions that sit in the backup root.
@@ -536,6 +718,8 @@ mod tests {
             duration_ms: 98_000,
             outcome: RunOutcome::Ok,
             parent: None,
+            skipped_sources: vec![r"D:anished-folder".into()],
+            copied_hashes: Default::default(),
         };
         repo.write_manifest(&m).unwrap();
         assert_eq!(repo.read_manifest(&m.id).unwrap(), m);
@@ -543,6 +727,94 @@ mod tests {
 
         std::fs::create_dir_all(repo.snapshot_dir(&m.id)).unwrap();
         assert_eq!(repo.manifests(), vec![m]);
+    }
+
+    /// Manifests written before `skipped_sources` existed must still load -- the field is
+    /// additive via `#[serde(default)]`, not a schema break.
+    #[test]
+    fn an_old_manifest_without_skipped_sources_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_init(tmp.path(), "T").unwrap();
+        let id = "2026-09-15T14-03-22Z";
+        let raw = r#"{
+            "id": "2026-09-15T14-03-22Z",
+            "job": "Projects",
+            "started": "2026-09-15T14:03:22Z",
+            "finished": "2026-09-15T14:05:00Z",
+            "sources": [],
+            "filesCopied": 1,
+            "filesLinked": 0,
+            "filesFailed": 0,
+            "bytesCopied": 10,
+            "bytesLinked": 0,
+            "durationMs": 42,
+            "outcome": "ok",
+            "parent": null
+        }"#;
+        let path = repo.manifest_path(id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, raw).unwrap();
+
+        let m = repo.read_manifest(id).unwrap();
+        assert_eq!(m.files_copied, 1);
+        assert!(m.skipped_sources.is_empty(), "a missing field defaults to empty");
+    }
+
+    /// F19: every snapshot DIRECTORY on disk lands in exactly one honesty bucket --
+    /// readable manifest, corrupt manifest, or no manifest. The old `manifests()`
+    /// filter_map made corrupt and incomplete snapshots equally invisible, so a damaged
+    /// repository presented as "fewer backups than you thought" with no signal.
+    #[test]
+    fn the_full_listing_sorts_every_snapshot_into_an_honesty_bucket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_init(tmp.path(), "T").unwrap();
+
+        // One healthy snapshot.
+        let good = "2026-01-01T00-00-00Z";
+        std::fs::create_dir_all(repo.snapshot_dir(good)).unwrap();
+        let m = SnapshotManifest {
+            id: good.into(),
+            job: "T".into(),
+            started: "2026-01-01T00:00:00Z".into(),
+            finished: "2026-01-01T00:01:00Z".into(),
+            sources: vec![],
+            files_copied: 1,
+            files_linked: 0,
+            files_failed: 0,
+            bytes_copied: 5,
+            bytes_linked: 0,
+            duration_ms: 1,
+            outcome: RunOutcome::Ok,
+            parent: None,
+            skipped_sources: vec![],
+            copied_hashes: Default::default(),
+        };
+        repo.write_manifest(&m).unwrap();
+
+        // One whose manifest is corrupt -- the tree may be intact, only the bookkeeping
+        // is damaged, so it must be LISTED with its error.
+        let corrupt = "2026-02-01T00-00-00Z";
+        std::fs::create_dir_all(repo.snapshot_dir(corrupt)).unwrap();
+        std::fs::write(repo.manifest_path(corrupt), b"{ not json").unwrap();
+
+        // One with no manifest at all: a run that died before finishing.
+        let partial = "2026-03-01T00-00-00Z";
+        std::fs::create_dir_all(repo.snapshot_dir(partial)).unwrap();
+
+        let listing = repo.list_snapshots_full();
+        assert_eq!(listing.manifests, vec![m.clone()]);
+        assert_eq!(listing.unreadable.len(), 1);
+        assert_eq!(listing.unreadable[0].0, corrupt, "the corrupt manifest names its id");
+        assert!(!listing.unreadable[0].1.is_empty(), "and carries the parse error");
+        assert_eq!(listing.incomplete, vec![partial]);
+
+        // The compat projection still answers what it always did -- readable only.
+        assert_eq!(repo.manifests(), vec![m]);
+
+        // Buckets stay oldest-first, matching snapshot_ids().
+        let json = serde_json::to_string(&listing).unwrap();
+        assert!(json.contains("\"incomplete\""), "{json}");
+        assert!(json.contains("\"unreadable\""), "{json}");
     }
 
     /// The manifest's `outcome` field must reach disk (and, from there, the frontend) as
@@ -615,10 +887,80 @@ mod tests {
         );
     }
 
+    /// F3: the reservation itself must be atomic. Two handles racing the same timestamp
+    /// must walk away with disjoint ids, because `create_dir`'s `AlreadyExists` is the
+    /// compare-and-swap -- the old check-then-create (`exists()`, caller creates) let
+    /// both racers observe "free" and take the SAME id, merging two runs into one
+    /// directory.
     #[test]
-    fn pruning_keeps_the_newest_n() {
+    fn racing_allocations_get_distinct_ids() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = Repo::open_or_init(tmp.path(), "T").unwrap();
+        let ts = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+
+        let barrier = std::sync::Barrier::new(8);
+        let ids: Vec<String> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    s.spawn(|| {
+                        let repo = repo.clone();
+                        let mut mine = Vec::new();
+                        // Release all racers at once to maximise the collision window.
+                        barrier.wait();
+                        for _ in 0..25 {
+                            mine.push(repo.allocate_snapshot_id(ts).unwrap());
+                        }
+                        mine
+                    })
+                })
+                .collect();
+            handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+        });
+
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(ids.len(), 200);
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "every racing allocation must get its own id -- a duplicate means two runs \
+             would share one snapshot directory"
+        );
+        // The reservation is real: every allocated id's directory already exists.
+        assert!(ids.iter().all(|id| repo.snapshot_dir(id).is_dir()));
+        // And the suffixed ids still list chronologically.
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(sorted, repo.snapshot_ids());
+    }
+
+    /// D2: retention pruning is per-JOB. The repo-wide predecessor of this query could
+    /// not see job boundaries at all, so two jobs sharing a destination pruned each
+    /// other's history.
+    #[test]
+    fn pruning_keeps_the_newest_n_of_that_job_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_init(tmp.path(), "T").unwrap();
+        let mk = |id: &str, job: &str| {
+            std::fs::create_dir_all(repo.snapshot_dir(id)).unwrap();
+            repo.write_manifest(&SnapshotManifest {
+                id: id.into(),
+                job: job.into(),
+                started: "2026-01-01T00:00:00Z".into(),
+                finished: "2026-01-01T00:01:00Z".into(),
+                sources: vec![],
+                files_copied: 0,
+                files_linked: 0,
+                files_failed: 0,
+                bytes_copied: 0,
+                bytes_linked: 0,
+                duration_ms: 0,
+                outcome: RunOutcome::Ok,
+                parent: None,
+                skipped_sources: vec![],
+                copied_hashes: Default::default(),
+            })
+            .unwrap();
+        };
         let ids = [
             "2026-01-01T00-00-00Z",
             "2026-02-01T00-00-00Z",
@@ -626,19 +968,42 @@ mod tests {
             "2026-04-01T00-00-00Z",
         ];
         for id in ids {
-            std::fs::create_dir_all(repo.snapshot_dir(id)).unwrap();
+            mk(id, "JobA");
         }
+        mk("2026-05-01T00-00-00Z", "JobB");
 
         assert_eq!(
-            repo.snapshots_to_prune(2),
+            repo.snapshots_to_prune_for_job("JobA", 2),
             vec!["2026-01-01T00-00-00Z", "2026-02-01T00-00-00Z"],
-            "the OLDEST are pruned"
+            "the OLDEST of that job are pruned"
         );
-        assert!(repo.snapshots_to_prune(4).is_empty());
-        assert!(repo.snapshots_to_prune(10).is_empty());
-        // keep = 0 means "keep everything", not "delete everything". Getting this backwards
-        // would silently destroy every backup.
-        assert!(repo.snapshots_to_prune(0).is_empty());
+        assert!(repo.snapshots_to_prune_for_job("JobA", 4).is_empty());
+        assert!(repo.snapshots_to_prune_for_job("JobA", 10).is_empty());
+        assert!(
+            repo.snapshots_to_prune_for_job("JobB", 1).is_empty(),
+            "JobB's single snapshot is within its own keep window"
+        );
+        // keep = 0 means "keep everything", not "delete everything". Getting this
+        // backwards would silently destroy every backup.
+        assert!(repo.snapshots_to_prune_for_job("JobA", 0).is_empty());
+
+        // The deletion half: two of JobA's oldest go, JobB's snapshot is untouched.
+        assert_eq!(repo.prune_job_snapshots("JobA", 2), 2);
+        assert_eq!(
+            repo.snapshot_ids(),
+            vec!["2026-03-01T00-00-00Z", "2026-04-01T00-00-00Z", "2026-05-01T00-00-00Z"]
+        );
+        assert!(repo.read_manifest("2026-05-01T00-00-00Z").is_ok());
+
+        // A snapshot whose manifest is unreadable is never retention-pruned: ownership
+        // is unprovable, and policy must not delete what it cannot identify.
+        std::fs::create_dir_all(repo.snapshot_dir("2025-01-01T00-00-00Z")).unwrap();
+        std::fs::write(repo.manifest_path("2025-01-01T00-00-00Z"), b"{ nope").unwrap();
+        assert_eq!(repo.snapshots_to_prune_for_job("JobA", 1), vec!["2026-03-01T00-00-00Z"]);
+        assert!(
+            !repo.snapshots_to_prune_for_job("JobA", 99).contains(&"2025-01-01T00-00-00Z".to_string()),
+            "unreadable manifests are never retention candidates"
+        );
     }
 
     /// Deleting a snapshot removes names, not data that another snapshot still references.

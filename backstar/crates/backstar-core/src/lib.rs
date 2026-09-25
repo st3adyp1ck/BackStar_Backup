@@ -21,7 +21,9 @@ mod parallel;
 pub mod presets;
 pub mod repo;
 pub mod restore;
+pub mod runlock;
 pub mod volume;
 pub mod walk;
 
 pub use error::{Error, Result};
+pub use runlock::RunLock;

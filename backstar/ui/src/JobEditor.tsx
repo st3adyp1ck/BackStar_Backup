@@ -1,46 +1,28 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { DailySchedule, ExcludeRules, Job, JobKind, Preset } from "./types";
+import type {
+  DailySchedule,
+  DefaultExcludes,
+  ExcludeRules,
+  Job,
+  JobKind,
+  Preset,
+  SaveJobResponse,
+} from "./types";
 
 /**
- * Mirrors `backstar_core::exclude::{PROJECT_EXCLUDE_DIRS, PROJECT_EXCLUDE_PATHS,
- * SYSTEM_EXCLUDE_DIRS, SYSTEM_EXCLUDE_FILES}`. Kept as two independent, mergeable toggles
- * rather than the original app's one-exclude-set-per-tab: a job made of both custom source
- * folders and system presets can reasonably want both sets applied at once, which a single
- * Project-vs-System choice could not express.
+ * The canonical exclude sets are fetched from the engine via `default_excludes` (L11) --
+ * this file used to hardcode a copy of `backstar_core::exclude`'s constants, and the two
+ * sides could drift: a stale UI copy would rebuild a job's rules from lists the engine no
+ * longer applies, or misclassify a real profile job as custom. The engine is the single
+ * source of truth; this component never names a single list entry itself.
+ *
+ * The sets stay two independent, mergeable toggles rather than the original app's
+ * one-exclude-set-per-tab: a job made of both custom source folders and system presets
+ * can reasonably want both sets applied at once, which a single Project-vs-System choice
+ * could not express.
  */
-const PROJECT_EXCLUDE_DIRS = [
-  "node_modules",
-  "dist",
-  "build",
-  ".next",
-  "__pycache__",
-  ".venv",
-  "venv",
-  "target",
-  ".gradle",
-  ".dart_tool",
-  ".expo",
-];
-const PROJECT_EXCLUDE_PATHS = [
-  "apps\\mobile\\ios\\App\\App\\public",
-  "apps\\mobile\\android\\app\\src\\main\\assets\\public",
-];
-const SYSTEM_EXCLUDE_DIRS = [
-  "Cache",
-  "Code Cache",
-  "GPUCache",
-  "cache2",
-  "Service Worker",
-  "CacheStorage",
-  "blob_storage",
-  "Crashpad",
-  "IndexedDB",
-  "$RECYCLE.BIN",
-  "System Volume Information",
-];
-const SYSTEM_EXCLUDE_FILES = ["Thumbs.db", "desktop.ini", "*.tmp"];
 
 /** `DailySchedule` <-> the string an `<input type="time">` wants, in both directions. */
 function formatScheduleTime(schedule: DailySchedule | null): string {
@@ -48,17 +30,69 @@ function formatScheduleTime(schedule: DailySchedule | null): string {
   return `${String(s.hour).padStart(2, "0")}:${String(s.minute).padStart(2, "0")}`;
 }
 
-function parseScheduleTime(time: string): DailySchedule {
+function parseScheduleTime(time: string): DailySchedule | null {
   const [hour, minute] = time.split(":").map((n) => Number.parseInt(n, 10));
-  return { hour: Number.isFinite(hour) ? hour : 2, minute: Number.isFinite(minute) ? minute : 0 };
+  // F57: validate before submit even though the picker constrains input -- a hand-typed
+  // or programmatically-set value must not reach the backend.
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return null;
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
+  return { hour, minute };
 }
 
-function buildExcludes(skipBuild: boolean, skipCaches: boolean): ExcludeRules {
+function buildExcludes(
+  defaults: DefaultExcludes,
+  skipBuild: boolean,
+  skipCaches: boolean,
+): ExcludeRules {
   return {
-    dir_names: [...(skipBuild ? PROJECT_EXCLUDE_DIRS : []), ...(skipCaches ? SYSTEM_EXCLUDE_DIRS : [])],
-    dir_paths: skipBuild ? PROJECT_EXCLUDE_PATHS : [],
-    file_patterns: skipCaches ? SYSTEM_EXCLUDE_FILES : [],
+    dir_names: [
+      ...(skipBuild ? defaults.project.dir_names : []),
+      ...(skipCaches ? defaults.system.dir_names : []),
+    ],
+    dir_paths: skipBuild ? defaults.project.dir_paths : [],
+    file_patterns: skipCaches ? defaults.system.file_patterns : [],
   };
+}
+
+/** Set-equality on string lists, so profile matching is order-insensitive. */
+function sameStrings(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  const sa = [...a].sort();
+  const sb = [...b].sort();
+  return sa.every((v, i) => v === sb[i]);
+}
+
+/** Every on/off combination of the two toggles, for profile matching (F59). */
+const PROFILE_COMBOS: [boolean, boolean][] = [
+  [false, false],
+  [true, false],
+  [false, true],
+  [true, true],
+];
+
+function matchesExcludeProfile(
+  defaults: DefaultExcludes,
+  excludes: ExcludeRules,
+  skipBuild: boolean,
+  skipCaches: boolean,
+): boolean {
+  const built = buildExcludes(defaults, skipBuild, skipCaches);
+  return (
+    sameStrings(excludes.dir_names, built.dir_names) &&
+    sameStrings(excludes.dir_paths, built.dir_paths) &&
+    sameStrings(excludes.file_patterns, built.file_patterns)
+  );
+}
+
+/** F57: compare paths the way Windows sees them -- case-insensitive, slash-agnostic. */
+function normalizePath(p: string): string {
+  return p.trim().replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
+}
+
+/** The final component of a path -- what becomes the subfolder name inside a backup. */
+function leafName(p: string): string {
+  const n = normalizePath(p);
+  return n.split("\\").pop() ?? n;
 }
 
 function fieldLabel(children: React.ReactNode) {
@@ -97,11 +131,14 @@ function TextButton({
 
 export function JobEditor({
   initial,
+  existingJobs,
   onSaved,
   onCancel,
 }: {
   /** `null` means creating a new job. */
   initial: Job | null;
+  /** Every configured job, for the duplicate-name check (F57). */
+  existingJobs: { id: string; name: string }[];
   onSaved: (job: Job) => void;
   onCancel: () => void;
 }) {
@@ -116,26 +153,101 @@ export function JobEditor({
   const [selectedPresets, setSelectedPresets] = useState<Set<string>>(
     new Set(initial?.presets ?? []),
   );
-  // Heuristic seed from an existing job's excludes: "was the project set applied" is well
-  // approximated by "does it contain node_modules", since that is the one entry unique to
-  // it. Good enough for round-tripping a job this editor itself created; a job with
-  // hand-edited excludes just starts both toggles off, which is a safe, inspectable default.
-  const [skipBuild, setSkipBuild] = useState(
-    initial?.excludes.dir_names.includes("node_modules") ?? false,
-  );
-  const [skipCaches, setSkipCaches] = useState(
-    initial?.excludes.dir_names.includes("Cache") ?? false,
-  );
+  const [excludesTouched, setExcludesTouched] = useState(false);
+  // Seeded from the fetched default sets once they arrive (see loadDefaultExcludes);
+  // until then the toggles are not rendered at all.
+  const [skipBuild, setSkipBuild] = useState(false);
+  const [skipCaches, setSkipCaches] = useState(false);
+  // The engine's canonical exclude sets (L11), fetched on mount. `null` while loading;
+  // on failure the toggles section shows an error with a retry, and saving an EXISTING
+  // job still works -- its stored rules round-trip unchanged (see `save`).
+  const [defaultExcludes, setDefaultExcludes] = useState<DefaultExcludes | null>(null);
+  const [excludesError, setExcludesError] = useState<string | null>(null);
 
   const [presets, setPresets] = useState<Preset[] | null>(null);
+  const [presetsError, setPresetsError] = useState<string | null>(null);
+  const [lockProneRunning, setLockProneRunning] = useState<string[]>([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // F15 hand-off: the job saved but Task Scheduler said no. The user must be told plainly
+  // and navigate back deliberately, not have the editor vanish as if all went well.
+  const [savedWithScheduleError, setSavedWithScheduleError] = useState<{
+    job: Job;
+    scheduleError: string;
+  } | null>(null);
+
+  function loadPresets() {
+    setPresetsError(null);
+    invoke<Preset[]>("list_presets")
+      .then((p) => {
+        setPresets(p);
+        setPresetsError(null);
+      })
+      // L8: a failed load must say so (with a way to retry), not leave "Loading…" forever.
+      .catch((e) => setPresetsError(String(e)));
+  }
+
+  // F59: a job whose stored excludes match NO toggle profile (both on, both off, either
+  // one alone) was customised outside this editor -- a hand edit, or a profile list that
+  // has since changed. Rebuilding from the two toggles on save would silently DISCARD
+  // those rules. The rule: custom excludes round-trip unchanged; excludes that match a
+  // profile rebuild from the toggles as before; and the moment the user touches a
+  // toggle, that explicit choice wins and the excludes rebuild from the toggles.
+  // Computed rather than state: the canonical sets arrive asynchronously (L11), and a
+  // useState initializer would have matched against a list that did not exist yet.
+  const customExcludes = Boolean(
+    initial &&
+      defaultExcludes &&
+      !PROFILE_COMBOS.some(([b, c]) => matchesExcludeProfile(defaultExcludes, initial.excludes, b, c)),
+  );
+
+  function loadDefaultExcludes() {
+    setExcludesError(null);
+    invoke<DefaultExcludes>("default_excludes")
+      .then((d) => {
+        setDefaultExcludes(d);
+        setExcludesError(null);
+        // Seed the toggles now that the real sets are known. An existing job matching a
+        // profile gets exactly that profile's combination; for a custom job this is only
+        // the toggles' starting point for IF the user decides to change them -- the
+        // stored rules are preserved until then (F59), so the overlap heuristic ("shares
+        // a dir name with the set") is enough.
+        if (initial) {
+          const combo = PROFILE_COMBOS.find(([b, c]) =>
+            matchesExcludeProfile(d, initial.excludes, b, c),
+          );
+          if (combo) {
+            setSkipBuild(combo[0]);
+            setSkipCaches(combo[1]);
+          } else {
+            setSkipBuild(initial.excludes.dir_names.some((n) => d.project.dir_names.includes(n)));
+            setSkipCaches(initial.excludes.dir_names.some((n) => d.system.dir_names.includes(n)));
+          }
+        }
+      })
+      .catch((e) => setExcludesError(String(e)));
+  }
 
   useEffect(() => {
-    invoke<Preset[]>("list_presets")
-      .then(setPresets)
-      .catch((e) => setError(String(e)));
+    loadPresets();
+    loadDefaultExcludes();
   }, []);
+
+  // F27: which lock-prone preset apps are running right now. Refetched when the selection
+  // changes so ticking a browser preset while the browser is open warns immediately.
+  // Failure of the command simply means no warning -- never a block on editing.
+  const presetSelectionKey = Array.from(selectedPresets).sort().join(",");
+  useEffect(() => {
+    let cancelled = false;
+    invoke<string[]>("list_lock_prone_running")
+      .then((keys) => {
+        if (!cancelled) setLockProneRunning(keys);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [presetSelectionKey]);
 
   async function addSource() {
     const picked = await open({ directory: true, multiple: false, title: "Add source folder" });
@@ -156,7 +268,74 @@ export function JobEditor({
     setSelectedPresets(next);
   }
 
-  const canSave = name.trim().length > 0 && dest.trim().length > 0 && (sources.length > 0 || selectedPresets.size > 0);
+  // ---- F57: client-side validation, computed live so the reason save is blocked is
+  // always on screen, not just a disabled button. The backend re-checks all of this
+  // (F45); the point of doing it here is a friendlier message next to the field.
+  const validationErrors: string[] = [];
+  const trimmedName = name.trim();
+  if (trimmedName && existingJobs.some(
+    (j) => j.id !== initial?.id && j.name.trim().toLowerCase() === trimmedName.toLowerCase(),
+  )) {
+    validationErrors.push(`A job named "${trimmedName}" already exists.`);
+  }
+  const normDest = dest.trim() ? normalizePath(dest) : null;
+  if (normDest) {
+    for (const src of sources) {
+      const s = normalizePath(src);
+      if (normDest === s) {
+        validationErrors.push(
+          `The destination is the same folder as the source ${src} — a backup cannot be its own source.`,
+        );
+        break;
+      }
+      if (normDest.startsWith(s + "\\")) {
+        validationErrors.push(
+          `The destination is inside the source ${src} — the backup would try to contain itself.`,
+        );
+        break;
+      }
+      if (s.startsWith(normDest + "\\")) {
+        validationErrors.push(
+          `The source ${src} is inside the destination — the backup would try to contain itself.`,
+        );
+        break;
+      }
+    }
+  }
+  {
+    const seen = new Map<string, string>();
+    for (const src of sources) {
+      const leaf = leafName(src);
+      const first = seen.get(leaf);
+      if (first !== undefined && normalizePath(first) !== normalizePath(src)) {
+        validationErrors.push(
+          `The sources "${first}" and "${src}" end in the same folder name ("${leaf}") — they would collide inside the backup. Rename one, or back them up in separate jobs.`,
+        );
+        break;
+      }
+      seen.set(leaf, src);
+    }
+  }
+  const parsedSchedule = scheduled ? parseScheduleTime(scheduleTime) : null;
+  if (scheduled && parsedSchedule === null) {
+    validationErrors.push("The schedule must be a valid 24-hour time.");
+  }
+  // A NEW job cannot be saved without the canonical sets -- its excludes come from the
+  // toggles, and inventing an empty set would silently back up build folders and browser
+  // caches. An existing job always can: its stored rules round-trip unchanged (F59).
+  if (defaultExcludes === null && initial === null) {
+    validationErrors.push(
+      excludesError
+        ? "The exclusion rules could not be loaded — retry above, then save."
+        : "Still loading the exclusion rules…",
+    );
+  }
+
+  const canSave =
+    trimmedName.length > 0 &&
+    dest.trim().length > 0 &&
+    (sources.length > 0 || selectedPresets.size > 0) &&
+    validationErrors.length === 0;
 
   async function save() {
     if (!canSave) return;
@@ -164,28 +343,80 @@ export function JobEditor({
     setError(null);
     const job: Job = {
       id: initial?.id ?? "",
-      name: name.trim(),
+      name: trimmedName,
       sources,
       dest,
       // Round-tripped, never reconstructed: editing a job must not wipe out a portable
       // destination record a previous run already backfilled.
       destPortable: initial?.destPortable ?? null,
       kind,
-      excludes: buildExcludes(skipBuild, skipCaches),
+      // Excludes round-trip unchanged when the stored rules are custom and untouched
+      // (F59) -- or when the canonical sets failed to load, in which case rebuilding
+      // from the toggles is impossible and passing the stored rules through unchanged
+      // is the only honest option.
+      excludes:
+        initial && (defaultExcludes === null || (customExcludes && !excludesTouched))
+          ? initial.excludes
+          : buildExcludes(defaultExcludes!, skipBuild, skipCaches),
       presets: Array.from(selectedPresets),
       gitGc,
       enabled,
-      schedule: scheduled ? parseScheduleTime(scheduleTime) : null,
+      schedule: scheduled ? parsedSchedule : null,
     };
     try {
-      const saved = await invoke<Job>("save_job", { job });
-      onSaved(saved);
+      const resp = await invoke<SaveJobResponse>("save_job", { job });
+      if (!resp.scheduleApplied && resp.scheduleError) {
+        setSavedWithScheduleError({ job: resp.job, scheduleError: resp.scheduleError });
+      } else {
+        onSaved(resp.job);
+      }
     } catch (e) {
       setError(String(e));
     } finally {
       setSaving(false);
     }
   }
+
+  if (savedWithScheduleError) {
+    return (
+      <div
+        className="mx-auto flex max-w-[640px] flex-col gap-4 rounded-[var(--radius-card)] border p-6"
+        style={{
+          background: "var(--c-surface)",
+          borderColor: "color-mix(in srgb, var(--c-warn) 40%, var(--c-border))",
+        }}
+        role="alert"
+      >
+        <h1 className="text-[18px] font-semibold tracking-[-0.01em]" style={{ color: "var(--c-warn)" }}>
+          Saved, but it will not run on schedule
+        </h1>
+        <p className="text-[13px]" style={{ color: "var(--c-text-dim)" }}>
+          The job &ldquo;{savedWithScheduleError.job.name}&rdquo; was saved and can be run by
+          hand, but Windows Task Scheduler rejected the scheduled task:
+        </p>
+        <p
+          className="selectable rounded-md px-3 py-2 font-mono text-[12px]"
+          style={{ background: "var(--c-surface-2)", color: "var(--c-text)" }}
+        >
+          {savedWithScheduleError.scheduleError}
+        </p>
+        <p className="text-[13px]" style={{ color: "var(--c-text-dim)" }}>
+          Edit the job and save it again to retry creating the task.
+        </p>
+        <div>
+          <button
+            onClick={() => onSaved(savedWithScheduleError.job)}
+            className="rounded-md px-4 py-2 text-[13px] font-medium"
+            style={{ background: "var(--c-accent)", color: "var(--c-on-accent)" }}
+          >
+            Back to jobs
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  const lockProneWarnings = lockProneRunning.filter((key) => selectedPresets.has(key));
 
   return (
     <div
@@ -211,7 +442,12 @@ export function JobEditor({
         {fieldLabel("Type")}
         <div className="flex gap-4 text-[13px]">
           <label className="flex cursor-pointer items-center gap-2">
-            <input type="radio" checked={kind === "snapshot"} onChange={() => setKind("snapshot")} />
+            <input
+              type="radio"
+              name="job-kind"
+              checked={kind === "snapshot"}
+              onChange={() => setKind("snapshot")}
+            />
             <span>
               Snapshot
               <span className="block text-[12px]" style={{ color: "var(--c-text-faint)" }}>
@@ -220,7 +456,12 @@ export function JobEditor({
             </span>
           </label>
           <label className="flex cursor-pointer items-center gap-2">
-            <input type="radio" checked={kind === "mirror"} onChange={() => setKind("mirror")} />
+            <input
+              type="radio"
+              name="job-kind"
+              checked={kind === "mirror"}
+              onChange={() => setKind("mirror")}
+            />
             <span>
               Mirror
               <span className="block text-[12px]" style={{ color: "var(--c-danger)" }}>
@@ -260,31 +501,62 @@ export function JobEditor({
 
       <div className="flex flex-col gap-1.5">
         {fieldLabel("System presets")}
-        {presets === null ? (
+        {presetsError ? (
+          <p className="text-[12.5px]" style={{ color: "var(--c-danger)" }} role="alert">
+            Could not load presets: {presetsError}{" "}
+            <button
+              onClick={loadPresets}
+              className="font-medium underline"
+              style={{ color: "var(--c-accent)" }}
+            >
+              Retry
+            </button>
+          </p>
+        ) : presets === null ? (
           <p className="text-[12.5px]" style={{ color: "var(--c-text-faint)" }}>
             Loading…
           </p>
         ) : (
           <div className="grid grid-cols-2 gap-1.5">
-            {presets.map((p) => (
-              <label
-                key={p.key}
-                className="flex items-center gap-2 text-[13px]"
-                style={{ color: p.found ? "var(--c-text)" : "var(--c-text-faint)" }}
-                title={p.found ? p.path ?? undefined : "Not found on this machine"}
-              >
-                <input
-                  type="checkbox"
-                  disabled={!p.found}
-                  checked={selectedPresets.has(p.key)}
-                  onChange={() => togglePreset(p.key)}
-                />
-                {p.label}
-                {!p.found && <span className="text-[11px]"> (missing)</span>}
-              </label>
-            ))}
+            {presets.map((p) => {
+              const selected = selectedPresets.has(p.key);
+              return (
+                <label
+                  key={p.key}
+                  className="flex items-center gap-2 text-[13px]"
+                  style={{ color: p.found ? "var(--c-text)" : "var(--c-text-faint)" }}
+                  title={p.found ? p.path ?? undefined : "Not found on this machine"}
+                >
+                  {/* F58: a vanished preset that IS selected must stay clickable -- it is
+                      the only way to turn it off. Only unselected missing presets lock. */}
+                  <input
+                    type="checkbox"
+                    disabled={!p.found && !selected}
+                    checked={selected}
+                    onChange={() => togglePreset(p.key)}
+                  />
+                  {p.label}
+                  {!p.found && (
+                    <span className="text-[11px]">
+                      {selected ? " (folder not found — uncheck to remove)" : " (missing)"}
+                    </span>
+                  )}
+                </label>
+              );
+            })}
           </div>
         )}
+        {/* F27: browser profiles are SQLite databases held open while the app runs; backing
+            one up live can capture a torn write that only shows up as a corrupt restore. */}
+        {lockProneWarnings.map((key) => {
+          const label = presets?.find((p) => p.key === key)?.label ?? key;
+          return (
+            <p key={key} className="text-[12.5px]" style={{ color: "var(--c-warn)" }} role="status">
+              {label} is running — its database may be copied mid-write; close it first for a
+              clean backup.
+            </p>
+          );
+        })}
       </div>
 
       <div className="flex flex-col gap-1.5">
@@ -298,14 +570,68 @@ export function JobEditor({
       </div>
 
       <div className="flex flex-col gap-2 text-[13px]">
-        <label className="flex cursor-pointer items-center gap-2">
-          <input type="checkbox" checked={skipBuild} onChange={(e) => setSkipBuild(e.target.checked)} />
-          Skip build/cache folders (node_modules, dist, .venv, target, …)
-        </label>
-        <label className="flex cursor-pointer items-center gap-2">
-          <input type="checkbox" checked={skipCaches} onChange={(e) => setSkipCaches(e.target.checked)} />
-          Skip browser caches and temp files (recommended with presets)
-        </label>
+        {excludesError ? (
+          <p className="text-[12.5px]" style={{ color: "var(--c-danger)" }} role="alert">
+            Could not load the exclusion rules: {excludesError}{" "}
+            <button
+              onClick={loadDefaultExcludes}
+              className="font-medium underline"
+              style={{ color: "var(--c-accent)" }}
+            >
+              Retry
+            </button>
+            {initial && (
+              <span className="mt-1 block text-[12px]" style={{ color: "var(--c-text-faint)" }}>
+                Saving keeps this job's stored rules unchanged.
+              </span>
+            )}
+          </p>
+        ) : defaultExcludes === null ? (
+          <p className="text-[12.5px]" style={{ color: "var(--c-text-faint)" }}>
+            Loading exclusion rules…
+          </p>
+        ) : (
+          <>
+            <label className="flex cursor-pointer items-center gap-2">
+              <input
+                type="checkbox"
+                checked={customExcludes && !excludesTouched ? false : skipBuild}
+                ref={(el) => {
+                  // Custom rules in effect: the toggles do not describe them, so show it.
+                  if (el) el.indeterminate = customExcludes && !excludesTouched;
+                }}
+                onChange={(e) => {
+                  setSkipBuild(e.target.checked);
+                  setExcludesTouched(true);
+                }}
+              />
+              {/* Examples come from the fetched set itself (L11), not a hardcoded list. */}
+              Skip build/cache folders (
+              {defaultExcludes.project.dir_names.slice(0, 4).join(", ")}, …)
+            </label>
+            <label className="flex cursor-pointer items-center gap-2">
+              <input
+                type="checkbox"
+                checked={customExcludes && !excludesTouched ? false : skipCaches}
+                ref={(el) => {
+                  if (el) el.indeterminate = customExcludes && !excludesTouched;
+                }}
+                onChange={(e) => {
+                  setSkipCaches(e.target.checked);
+                  setExcludesTouched(true);
+                }}
+              />
+              Skip browser caches and temp files (recommended with presets)
+            </label>
+            {customExcludes && !excludesTouched && (
+              <p className="text-[12px]" style={{ color: "var(--c-warn)" }}>
+                This job has custom exclusion rules that the toggles cannot represent — they are
+                kept unchanged unless you change a toggle, which replaces them with the standard
+                sets.
+              </p>
+            )}
+          </>
+        )}
         {kind === "snapshot" && (
           <label className="flex cursor-pointer items-center gap-2">
             <input type="checkbox" checked={gitGc} onChange={(e) => setGitGc(e.target.checked)} />
@@ -337,13 +663,23 @@ export function JobEditor({
           />
         </label>
         <p className="text-[12px]" style={{ color: "var(--c-text-faint)" }}>
-          Runs via Windows Task Scheduler, even while BackStar is closed. The computer must be on
-          and awake at that time.
+          Runs via Windows Task Scheduler, even while BackStar is closed. A run missed because
+          the computer was off or asleep catches up when it is next awake.
         </p>
       </div>
 
+      {validationErrors.length > 0 && (
+        <ul className="flex flex-col gap-1" role="alert">
+          {validationErrors.map((v, i) => (
+            <li key={i} className="text-[12.5px]" style={{ color: "var(--c-danger)" }}>
+              {v}
+            </li>
+          ))}
+        </ul>
+      )}
+
       {error && (
-        <p className="text-[13px]" style={{ color: "var(--c-danger)" }}>
+        <p className="text-[13px]" style={{ color: "var(--c-danger)" }} role="alert">
           {error}
         </p>
       )}

@@ -22,12 +22,17 @@ backstar-core.workspace = true
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2"
+tauri-plugin-updater = "2"
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 time.workspace = true
 uuid.workspace = true
+
+# For the F27 process snapshot (Toolhelp) in lockcheck.rs.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_System_Diagnostics_ToolHelp"] }
 
 [dev-dependencies]
 tempfile = "3"

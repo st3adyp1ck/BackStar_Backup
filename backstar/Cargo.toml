@@ -3,7 +3,7 @@ members = ["crates/backstar-core", "src-tauri", "src-restore"]
 resolver = "2"
 
 [workspace.package]
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 rust-version = "1.82"
 authors = ["st3adyp1ck"]
@@ -41,9 +41,11 @@ features = [
 ]
 
 # Release builds: optimize for a small, fast single binary.
+# NOTE: no `panic = "abort"` here -- a panic on the run thread must kill neither the
+# process nor the user's confidence in it; runner.rs catches it and reports a Failed run
+# (F18). Unwinding is what makes that catch possible.
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
-panic = "abort"

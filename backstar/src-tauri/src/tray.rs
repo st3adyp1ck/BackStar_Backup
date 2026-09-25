@@ -14,11 +14,12 @@
 //!   in-flight copy is never interrupted by an accidental X click), and the tray's own
 //!   "Exit" item is always available for a real, deliberate quit.
 //!
-//! A deliberate quit (`Exit` from the tray menu) is allowed to end the process even
-//! mid-run. That is not a data-safety compromise: every write in this app is
-//! temp-file-then-rename (`backstar_core::copy::copy_file`), so an abrupt process kill can
-//! only ever leave an orphaned `.backstar-tmp-*` file behind -- never a half-written
-//! destination file. A future run's own directory creation coexists with that harmlessly.
+//! A deliberate quit (`Exit` from the tray menu) is refused while a run is in flight
+//! (D6/F42): a tray menu cannot host a modal confirm, so the honest behavior is to bring
+//! up the window -- which shows the running panel with its Cancel button -- and stay
+//! alive. When nothing is running, Exit exits. This replaces the pre-B2 behavior of
+//! letting Exit kill the process mid-run, which was survivable for data (every write is
+//! temp-file-then-rename) but the exact opposite of what a user means by tidying up.
 
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -29,6 +30,25 @@ use crate::runner::Runner;
 const OPEN_ID: &str = "open";
 const EXIT_ID: &str = "exit";
 const MAIN_WINDOW: &str = "main";
+
+/// What the tray's Exit item should do, given whether a run is in flight. Split out pure
+/// so the decision is unit-testable (F42).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitDecision {
+    /// Nothing running: exit.
+    Exit,
+    /// A run is in flight: refuse to exit and show the window (which displays the running
+    /// panel and its Cancel button) instead.
+    ShowWindow,
+}
+
+fn exit_decision(busy: bool) -> ExitDecision {
+    if busy {
+        ExitDecision::ShowWindow
+    } else {
+        ExitDecision::Exit
+    }
+}
 
 pub fn setup(app: &AppHandle) -> tauri::Result<()> {
     let open_item = MenuItemBuilder::new("Open BackStar").id(OPEN_ID).build(app)?;
@@ -44,7 +64,22 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().0.as_str() {
             OPEN_ID => show_main_window(app),
-            EXIT_ID => app.exit(0),
+            EXIT_ID => {
+                let busy = app
+                    .try_state::<Runner>()
+                    .map(|r| r.running_label().is_some())
+                    .unwrap_or(false);
+                match exit_decision(busy) {
+                    ExitDecision::Exit => app.exit(0),
+                    ExitDecision::ShowWindow => {
+                        tracing::warn!(
+                            "exit requested from the tray while a run is in progress -- \
+                             showing the window instead of exiting"
+                        );
+                        show_main_window(app);
+                    }
+                }
+            }
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -100,5 +135,18 @@ fn show_main_window(app: &AppHandle) {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F42/D6: tray Exit refuses while a run is in flight (showing the window instead)
+    /// and exits when idle.
+    #[test]
+    fn tray_exit_refuses_while_busy_and_exits_when_idle() {
+        assert_eq!(exit_decision(true), ExitDecision::ShowWindow);
+        assert_eq!(exit_decision(false), ExitDecision::Exit);
     }
 }

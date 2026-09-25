@@ -10,8 +10,9 @@
 //! - Unicode file and folder names (the app's log parser decoded robocopy's ANSI-codepage
 //!   stdout, so `café.txt` silently failed verification -- see `UPGRADE-PLAN.md` D1).
 //! - A path near/over the 260-character MAX_PATH limit.
-//! - Read-only and hidden files.
+//! - Read-only and hidden files (attributes compared, not just content -- L6).
 //! - A zero-byte file.
+//! - Empty directories, bare and nested under a populated chain (MT1 / decision D8).
 //! - A file with an NTFS alternate data stream.
 //! - A file that changes between two runs, to prove restore hands back the RIGHT version.
 //! - A moderately large file, to exercise more than one progress callback.
@@ -26,9 +27,10 @@ use std::sync::atomic::AtomicBool;
 
 use backstar_core::config::{Job, JobKind};
 use backstar_core::engine;
+use backstar_core::events::RunOutcome;
 use backstar_core::exclude::ExcludeRules;
 use backstar_core::repo::Repo;
-use backstar_core::restore;
+use backstar_core::restore::{self, OverwritePolicy};
 
 fn job_for(sources: Vec<PathBuf>, dest: PathBuf) -> Job {
     Job {
@@ -54,6 +56,12 @@ fn write_file(path: &Path, contents: &[u8]) {
 /// Byte-for-byte comparison of every file under `a` against the matching path under `b`.
 /// Panics with the specific mismatching path, not just "trees differ" -- this test exists
 /// to pinpoint exactly which awkward case broke, not just to know that something did.
+///
+/// L6: compares the DIRECTORY sets too (an empty dir is content-shaped information, D8),
+/// and per-file read-only/hidden attributes. mtimes are compared exactly, but only when
+/// the temp volume is known to store fine-grained timestamps (CopyFileExW preserves the
+/// last-write time; on a FAT-family temp volume the two-second rounding would make an
+/// exact comparison meaningless rather than failing on a real bug).
 fn assert_trees_identical(a: &Path, b: &Path) {
     fn walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(dir).unwrap() {
@@ -63,6 +71,16 @@ fn assert_trees_identical(a: &Path, b: &Path) {
                 walk(root, &path, out);
             } else {
                 out.push(path.strip_prefix(root).unwrap().to_path_buf());
+            }
+        }
+    }
+    fn walk_dirs(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_dir() {
+                out.push(path.strip_prefix(root).unwrap().to_path_buf());
+                walk_dirs(root, &path, out);
             }
         }
     }
@@ -80,6 +98,22 @@ fn assert_trees_identical(a: &Path, b: &Path) {
         "the set of restored files does not match the original tree"
     );
 
+    let mut a_dirs = Vec::new();
+    walk_dirs(a, a, &mut a_dirs);
+    a_dirs.sort();
+    let mut b_dirs = Vec::new();
+    walk_dirs(b, b, &mut b_dirs);
+    b_dirs.sort();
+    assert_eq!(
+        a_dirs, b_dirs,
+        "the set of restored DIRECTORIES (including empty ones) does not match"
+    );
+
+    // FAT-family volumes store mtimes at two-second resolution; exact comparison only
+    // has meaning where both sides keep fine-grained times.
+    let compare_mtimes = !backstar_core::volume::probe_destination(a).stores_coarse_mtimes()
+        && !backstar_core::volume::probe_destination(b).stores_coarse_mtimes();
+
     for rel in &a_files {
         let original = std::fs::read(a.join(rel)).unwrap();
         let restored = std::fs::read(b.join(rel)).unwrap();
@@ -89,7 +123,37 @@ fn assert_trees_identical(a: &Path, b: &Path) {
             original.len(),
             restored.len()
         );
+
+        let md_a = std::fs::metadata(a.join(rel)).unwrap();
+        let md_b = std::fs::metadata(b.join(rel)).unwrap();
+        assert_eq!(
+            md_a.permissions().readonly(),
+            md_b.permissions().readonly(),
+            "read-only attribute mismatch at {rel:?}"
+        );
+        #[cfg(windows)]
+        assert_eq!(is_hidden(&a.join(rel)), is_hidden(&b.join(rel)), "hidden attribute mismatch at {rel:?}");
+        if compare_mtimes {
+            assert_eq!(
+                md_a.modified().unwrap(),
+                md_b.modified().unwrap(),
+                "mtime mismatch at {rel:?} -- CopyFileExW must preserve the last-write time"
+            );
+        }
     }
+}
+
+#[cfg(windows)]
+fn is_hidden(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{GetFileAttributesW, FILE_ATTRIBUTE_HIDDEN};
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let attrs: u32 = unsafe { GetFileAttributesW(PCWSTR(wide.as_ptr())) };
+    // u32::MAX is INVALID_FILE_ATTRIBUTES: report not-hidden rather than panicking, so a
+    // genuinely missing file still fails on the content/set comparisons above.
+    attrs != u32::MAX && attrs & FILE_ATTRIBUTE_HIDDEN.0 != 0
 }
 
 /// Build the nasty fixture tree and return its root.
@@ -113,6 +177,12 @@ fn build_fixture(root: &Path) {
 
     // Zero-byte file.
     write_file(&root.join("empty.txt"), b"");
+
+    // Empty directories (MT1 / D8): one bare, one nested under a populated chain. The
+    // copy phase only ever creates directories that have files in them, so these only
+    // survive if the engine preserves the tree's shape explicitly.
+    std::fs::create_dir_all(root.join("empty-dir")).unwrap();
+    std::fs::create_dir_all(root.join("deep/with-empty-sibling")).unwrap();
 
     // A path close to / over the 260-character MAX_PATH limit, built from nested
     // directories so no single component is unreasonable.
@@ -183,10 +253,20 @@ fn backup_then_restore_reproduces_the_fixture_byte_for_byte() {
 
     let backup = tmp.path().join("backup");
     let job = job_for(vec![src.clone()], backup.clone());
-    let manifest = engine::run_job(&job, &AtomicBool::new(false), &mut |_| {})
+    let manifest = engine::run_job(&job, None, &AtomicBool::new(false), &mut |_| {})
         .expect("backup should succeed over the awkward fixture");
 
+    // L6: a clean fixture must end with a clean outcome -- not merely "no failed files"
+    // (which would also hold for a run that skipped something it should have protected).
+    assert_eq!(manifest.outcome, RunOutcome::Ok);
     assert_eq!(manifest.files_failed, 0, "no file in the fixture should fail to back up");
+    // MT1: the empty directories must exist in the snapshot itself, not just on restore.
+    let snap_src = backup.join("snapshots").join(&manifest.id).join("source");
+    assert!(snap_src.join("empty-dir").is_dir(), "the bare empty dir must be snapshotted");
+    assert!(
+        snap_src.join("deep/with-empty-sibling").is_dir(),
+        "an empty dir nested under a populated one must be snapshotted"
+    );
 
     let repo = Repo::open(&backup).unwrap();
     let restored = tmp.path().join("restored");
@@ -195,6 +275,7 @@ fn backup_then_restore_reproduces_the_fixture_byte_for_byte() {
         &manifest.id,
         Path::new("source"),
         &restored,
+            OverwritePolicy::Always,
         &AtomicBool::new(false),
         &mut |_| {},
     )
@@ -216,10 +297,10 @@ fn restoring_an_older_snapshot_returns_that_version_not_the_latest() {
     let backup = tmp.path().join("backup");
 
     let job = job_for(vec![src.clone()], backup.clone());
-    let first = engine::run_job(&job, &AtomicBool::new(false), &mut |_| {}).unwrap();
+    let first = engine::run_job(&job, None, &AtomicBool::new(false), &mut |_| {}).unwrap();
 
     write_file(&src.join("doc.txt"), b"version two -- much longer than the first");
-    let _second = engine::run_job(&job, &AtomicBool::new(false), &mut |_| {}).unwrap();
+    let _second = engine::run_job(&job, None, &AtomicBool::new(false), &mut |_| {}).unwrap();
 
     let repo = Repo::open(&backup).unwrap();
     let restored = tmp.path().join("restored-old.txt");
@@ -228,6 +309,7 @@ fn restoring_an_older_snapshot_returns_that_version_not_the_latest() {
         &first.id,
         Path::new("source/doc.txt"),
         &restored,
+            OverwritePolicy::Always,
         &AtomicBool::new(false),
         &mut |_| {},
     )
@@ -256,7 +338,7 @@ fn an_alternate_data_stream_survives_backup_and_restore() {
 
     let backup = tmp.path().join("backup");
     let job = job_for(vec![src], backup.clone());
-    let manifest = engine::run_job(&job, &AtomicBool::new(false), &mut |_| {}).unwrap();
+    let manifest = engine::run_job(&job, None, &AtomicBool::new(false), &mut |_| {}).unwrap();
 
     // The stream must already be present in the snapshot itself -- CopyFileExW carries
     // secondary data streams by default between NTFS volumes.
@@ -272,6 +354,7 @@ fn an_alternate_data_stream_survives_backup_and_restore() {
         &manifest.id,
         Path::new("source/host.txt"),
         &restored,
+            OverwritePolicy::Always,
         &AtomicBool::new(false),
         &mut |_| {},
     )
@@ -292,7 +375,7 @@ fn readonly_and_hidden_attributes_do_not_block_restore() {
 
     let backup = tmp.path().join("backup");
     let job = job_for(vec![src], backup.clone());
-    let manifest = engine::run_job(&job, &AtomicBool::new(false), &mut |_| {}).unwrap();
+    let manifest = engine::run_job(&job, None, &AtomicBool::new(false), &mut |_| {}).unwrap();
 
     let repo = Repo::open(&backup).unwrap();
     let restored = tmp.path().join("restored");
@@ -306,6 +389,7 @@ fn readonly_and_hidden_attributes_do_not_block_restore() {
             &manifest.id,
             Path::new("source"),
             &restored,
+            OverwritePolicy::Always,
             &AtomicBool::new(false),
             &mut |_| {},
         )
